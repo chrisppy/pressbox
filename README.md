@@ -15,6 +15,10 @@ through its API. Each client is paired with a short code; there is no website
 and no shared secret. [Birdland](https://github.com/chrisppy/birdland)'s bar can
 show the unread count.
 
+> [!NOTE]
+> pressbox is in its early days. Expect rough edges, and configuration and
+> behavior that may change between versions.
+
 ```
 NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items, search index, devices)
 (services.pressbox.feeds)            │ HTTP API, one token per device
