@@ -343,7 +343,7 @@ pressbox/
 ├── assets/                        logo and app icon (CC-BY-SA-4.0)
 ├── LICENSES/                      license texts (REUSE)
 ├── .github/workflows/             flake check, cargo-deny, lock updates
-├── flake.nix, Cargo.toml, REUSE.toml
+├── flake.nix, Cargo.toml, REUSE.toml, justfile
 ├── deny.toml                      allowed licenses and sources (cargo-deny)
 ├── CHANGELOG.md
 └── README.md
@@ -355,11 +355,14 @@ there; that is why the NixOS and Home Manager modules live in `modules/`.
 ## Development
 
 ```sh
-nix develop          # Rust toolchain, treefmt
-cargo test
-nix fmt              # devfmt's treefmt setup
-nix flake check      # builds, module checks and a NixOS VM test
-cargo deny check     # advisories, licenses, duplicate crates, sources
+nix develop          # Rust toolchain, treefmt, just, cargo-deny
+just                 # list the recipes
+just test            # cargo test
+just lint            # clippy, warnings as errors
+just fmt             # devfmt's treefmt setup
+just deny            # advisories, licenses, duplicate crates, sources
+just check           # nix flake check: builds, module checks, NixOS VM test
+just verify          # all of the above, as CI does
 ```
 
 `cargo deny` also runs in CI on every push and weekly, so a new advisory against
@@ -375,8 +378,10 @@ generates: `listen`, `database`, `refresh_interval`, `max_items_per_feed`,
 `max_age_days`, `behind_proxy`, `control_socket`, `backup_dir`, `token_file`,
 `[feeds.<id>]` with `url`, `title`, `tags`, `refresh_interval`, `full_text`, and
 `[users.<name>]` with `admin` and `[users.<name>.feeds.<id>]`) and run
-`cargo run -p pressboxd -- -c pressbox.toml`. The control socket defaults to
-`pressbox.sock` next to the database: `pressboxctl -s ./pressbox.sock status`.
+`just server` (or `cargo run -p pressboxd -- -c pressbox.toml`). The control
+socket defaults to `pressbox.sock` next to the database:
+`just ctl -s ./pressbox.sock status`. `just tui` runs the terminal client the
+same way.
 
 ## License
 

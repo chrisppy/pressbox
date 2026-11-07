@@ -9,7 +9,9 @@ _: {
         inputsFrom = [ config.packages.pressboxd ];
         packages = [
           pkgs.cargo
+          pkgs.cargo-deny
           pkgs.clippy
+          pkgs.just
           pkgs.rust-analyzer
           pkgs.rustc
           pkgs.rustfmt
