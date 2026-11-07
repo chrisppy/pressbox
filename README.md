@@ -355,7 +355,8 @@ there; that is why the NixOS and Home Manager modules live in `modules/`.
 ## Development
 
 ```sh
-nix develop          # Rust toolchain, treefmt, just, cargo-deny
+nix develop          # Rust toolchain, treefmt, just, cargo-deny (optional:
+                     # outside it, the recipes run Cargo through nix develop)
 just                 # list the recipes
 just test            # cargo test
 just lint            # clippy, warnings as errors

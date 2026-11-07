@@ -3,41 +3,45 @@
 
 set dotenv-load := false
 
+# Cargo comes from the dev shell: use it directly inside `nix develop` (or
+# direnv), and run it through `nix develop` otherwise.
+cargo := if env("IN_NIX_SHELL", "") == "" { "nix develop --command cargo" } else { "cargo" }
+
 # List available recipes
 default:
     @just --list
 
 # Build everything with Cargo
 build:
-    cargo build --workspace
+    {{ cargo }} build --workspace
 
 # Run the tests
 test:
-    cargo test --workspace
+    {{ cargo }} test --workspace
 
 # Lint with Clippy, warnings as errors (as CI does)
 lint:
-    cargo clippy --workspace --all-targets -- -D warnings
+    {{ cargo }} clippy --workspace --all-targets -- -D warnings
 
 # Check advisories, licenses, duplicate crates and sources
 deny:
-    cargo deny check
+    {{ cargo }} deny check
 
 # Time the database on 100k items (not a test)
 bench:
-    cargo test --release -p pressboxd bench -- --ignored --nocapture
+    {{ cargo }} test --release -p pressboxd bench -- --ignored --nocapture
 
 # Run the server with a local config (see "Development" in the README)
 server config="pressbox.toml":
-    cargo run -p pressboxd -- -c {{ config }}
+    {{ cargo }} run -p pressboxd -- -c {{ config }}
 
 # Run pressboxctl, e.g. `just ctl -s ./pressbox.sock status`
 ctl *args:
-    cargo run -q -p pressboxd --bin pressboxctl -- {{ args }}
+    {{ cargo }} run -q -p pressboxd --bin pressboxctl -- {{ args }}
 
 # Run the terminal client, e.g. `just tui whoami`
 tui *args:
-    cargo run -q -p pressbox -- {{ args }}
+    {{ cargo }} run -q -p pressbox -- {{ args }}
 
 # Build a package with Nix: pressboxd (default) or pressbox
 package name="pressboxd":
@@ -68,5 +72,5 @@ verify: fmt-check lint test deny check
 
 # Remove Cargo and Nix build output
 clean:
-    cargo clean
+    {{ cargo }} clean
     rm -f result result-*
