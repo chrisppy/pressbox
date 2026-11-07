@@ -6,6 +6,11 @@
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
+    fenix = {
+      url = "github:nix-community/fenix";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
     devfmt = {
       url = "github:chrisppy/devfmt";
       inputs.nixpkgs.follows = "nixpkgs";

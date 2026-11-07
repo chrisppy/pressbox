@@ -3,18 +3,20 @@
 
 _: {
   perSystem =
-    { pkgs, config, ... }:
     {
-      devShells.default = pkgs.mkShell {
+      pkgs,
+      config,
+      craneLib,
+      ...
+    }:
+    {
+      # The same fenix toolchain the packages build with (cargo, rustc, clippy,
+      # rustfmt, rust-analyzer, rust-src), plus the packages' build inputs.
+      devShells.default = craneLib.devShell {
         inputsFrom = [ config.packages.pressboxd ];
         packages = [
-          pkgs.cargo
           pkgs.cargo-deny
-          pkgs.clippy
           pkgs.just
-          pkgs.rust-analyzer
-          pkgs.rustc
-          pkgs.rustfmt
           pkgs.sqlite
           config.treefmt.build.wrapper
         ];

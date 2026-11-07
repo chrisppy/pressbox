@@ -83,7 +83,8 @@ pressbox/
 │   ├── nixos.nix                  services.pressbox (AGPL-3.0-only)
 │   └── home-manager.nix           programs.pressbox
 ├── nix/                           flake-parts modules, loaded by devfmt
-│   ├── packages.nix               pressboxd, pressbox
+│   ├── rust.nix                   Rust toolchain (fenix) and crane
+│   ├── packages.nix               pressboxd, pressbox (crane), Clippy check
 │   ├── modules.nix                exports the NixOS and Home Manager modules
 │   ├── checks.nix                 module checks, NixOS VM test, reuse lint
 │   └── devshell.nix               nix develop

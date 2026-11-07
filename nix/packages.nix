@@ -1,21 +1,43 @@
 # SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
 # SPDX-License-Identifier: GPL-3.0-only
 
+# pressboxd and pressbox, built with crane: the workspace's dependencies are
+# built once (cargoArtifacts) and shared by both packages and the Clippy check.
 _: {
   perSystem =
-    { pkgs, lib, ... }:
+    {
+      pkgs,
+      lib,
+      craneLib,
+      ...
+    }:
     let
       cargoToml = lib.importTOML ../Cargo.toml;
 
-      rustSrc = lib.fileset.toSource {
+      src = lib.fileset.toSource {
         root = ../.;
         fileset = lib.fileset.unions [
           ../Cargo.toml
           ../Cargo.lock
-          ../crates
-          ../clients/tui
+          (craneLib.fileset.commonCargoSources ../crates)
+          (craneLib.fileset.commonCargoSources ../clients/tui)
         ];
       };
+
+      commonArgs = {
+        inherit src;
+        inherit (cargoToml.workspace.package) version;
+        pname = "pressbox-workspace";
+        strictDeps = true;
+
+        # reqwest (rustls) loads the system CA certificates when a client is
+        # built, and the build sandbox has none, so tests that build a client
+        # fail with "No CA certificates were loaded from the system".
+        # cacert's setup hook points SSL_CERT_FILE at its bundle.
+        nativeCheckInputs = [ pkgs.cacert ];
+      };
+
+      cargoArtifacts = craneLib.buildDepsOnly commonArgs;
 
       mkCrate =
         {
@@ -24,32 +46,20 @@ _: {
           license,
           mainProgram ? pname,
         }:
-        pkgs.rustPlatform.buildRustPackage {
-          inherit pname;
-          inherit (cargoToml.workspace.package) version;
-          src = rustSrc;
-          cargoLock.lockFile = ../Cargo.lock;
-          cargoBuildFlags = [
-            "--package"
-            pname
-          ];
-          cargoTestFlags = [
-            "--package"
-            pname
-          ];
+        craneLib.buildPackage (
+          commonArgs
+          // {
+            inherit pname cargoArtifacts;
+            # Applies to both the build and the tests.
+            cargoExtraArgs = "--locked --package ${pname}";
 
-          # reqwest (rustls) loads the system CA certificates when a client is
-          # built, and the build sandbox has none, so tests that build a client
-          # fail with "No CA certificates were loaded from the system".
-          # cacert's setup hook points SSL_CERT_FILE at its bundle.
-          nativeCheckInputs = [ pkgs.cacert ];
-
-          meta = {
-            inherit description license mainProgram;
-            homepage = "https://github.com/chrisppy/pressbox";
-            platforms = lib.platforms.unix;
-          };
-        };
+            meta = {
+              inherit description license mainProgram;
+              homepage = "https://github.com/chrisppy/pressbox";
+              platforms = lib.platforms.unix;
+            };
+          }
+        );
 
       pressboxd = mkCrate {
         pname = "pressboxd";
@@ -68,5 +78,14 @@ _: {
         inherit pressboxd pressbox;
         default = pressboxd;
       };
+
+      # Same as `just lint`.
+      checks.clippy = craneLib.cargoClippy (
+        commonArgs
+        // {
+          inherit cargoArtifacts;
+          cargoClippyExtraArgs = "--workspace --all-targets -- --deny warnings";
+        }
+      );
     };
 }
