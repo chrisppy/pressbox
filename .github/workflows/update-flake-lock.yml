@@ -1,0 +1,19 @@
+# SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
+# SPDX-License-Identifier: GPL-3.0-only
+
+name: Update flake inputs
+
+on:
+  schedule:
+    # Every day at midnight UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update-flake-lock:
+    uses: chrisppy/github-workflows/.github/workflows/update-flake-lock.yml@master
+    permissions:
+      contents: write

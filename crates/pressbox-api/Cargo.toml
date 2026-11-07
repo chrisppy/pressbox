@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
+# SPDX-License-Identifier: GPL-3.0-only
+
+[package]
+description            = "Shared API types for pressbox"
+edition.workspace      = true
+license                = "GPL-3.0-only"
+name                   = "pressbox-api"
+publish                = false
+repository.workspace   = true
+rust-version.workspace = true
+version.workspace      = true
+
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }

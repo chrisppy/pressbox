@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
+# SPDX-License-Identifier: GPL-3.0-only
+
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/): run in CI by
+# .github/workflows/deny.yml, or locally with `cargo deny check`.
+
+[graph]
+all-features = true
+
+[licenses]
+# Licenses dependencies may use: only those in use today, all compatible
+# with linking into the AGPL-3.0-only server and the GPL-3.0-only TUI.
+# Anything else fails CI until someone checks it and adds it here.
+allow = [
+  "Apache-2.0",
+  "BSD-3-Clause",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "MPL-2.0",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[licenses.private]
+# Our own crates are not published; their licenses are checked by REUSE.
+ignore = true
+
+[advisories]
+# Every RustSec advisory fails, including unmaintained crates and yanked
+# versions, unless listed in `ignore` with a reason.
+ignore = []
+yanked = "deny"
+
+[bans]
+multiple-versions = "warn"
+wildcards         = "deny"
+# Our own crates depend on each other by path.
+allow-wildcard-paths = true
+
+[sources]
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]
+unknown-git      = "deny"
+unknown-registry = "deny"

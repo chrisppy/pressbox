@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
+# SPDX-License-Identifier: GPL-3.0-only
+
+# Licensing for files that cannot carry a header. See https://reuse.software.
+# The server (crates/pressboxd, modules/nixos.nix) is AGPL-3.0-only; the logo
+# is CC-BY-SA-4.0; the terminal client, shared types, build files and docs are
+# GPL-3.0-only. Each file's own SPDX header says which.
+version = 1
+
+[[annotations]]
+SPDX-FileCopyrightText  = "2026 Chris Palmer <chris@red-oxide.org>"
+SPDX-License-Identifier = "GPL-3.0-only"
+path                    = ["Cargo.lock", "flake.lock"]

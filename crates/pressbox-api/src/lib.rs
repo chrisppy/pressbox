@@ -1,0 +1,232 @@
+// SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
+// SPDX-License-Identifier: GPL-3.0-only
+
+//! Types shared by the pressbox server and its Rust clients.
+//!
+//! These are the JSON shapes of the HTTP API. Timestamps are Unix seconds
+//! (UTC) so every client (Rust, QML, Swift) can decode them without a date
+//! parser.
+
+use serde::{Deserialize, Serialize};
+
+/// A feed declared in the server configuration, with its current state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Feed {
+    /// The attribute name used in the Nix configuration, e.g. `"lwn"`.
+    pub id: String,
+    /// The configured title, or the title the feed reports about itself.
+    pub title: String,
+    /// The URL that is polled.
+    pub url: String,
+    /// The website the feed belongs to, if it says.
+    pub site_url: Option<String>,
+    pub tags: Vec<String>,
+    pub unread: u32,
+    pub total: u32,
+    /// When the feed was last fetched, successfully or not.
+    pub last_fetched: Option<i64>,
+    /// The error from the last fetch, if it failed.
+    pub last_error: Option<String>,
+    /// The feed was removed from the configuration but is kept because it
+    /// has starred items. It is no longer fetched.
+    #[serde(default)]
+    pub archived: bool,
+}
+
+/// One entry from a feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Item {
+    pub id: i64,
+    pub feed_id: String,
+    pub title: String,
+    pub url: Option<String>,
+    pub author: Option<String>,
+    /// Short HTML summary, if the feed provides one.
+    pub summary: Option<String>,
+    /// Full HTML content, if the feed provides it. Only included by
+    /// `GET /api/v1/items/{id}`; list responses leave it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Publication time, or the time pressbox first saw the item.
+    pub published: i64,
+    pub read: bool,
+    pub starred: bool,
+}
+
+/// A page of items, newest first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemPage {
+    pub items: Vec<Item>,
+    /// Pass as `offset` to get the next page; `None` on the last page.
+    pub next_offset: Option<u32>,
+}
+
+/// Body for `PUT /api/v1/items/{id}/read` and `PUT /api/v1/items/{id}/starred`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Flag {
+    pub value: bool,
+}
+
+/// Response for `POST /api/v1/feeds/{id}/read-all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Updated {
+    pub updated: u32,
+}
+
+/// Query parameters for `GET /api/v1/items`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemQuery {
+    /// Full-text search over titles and text. Words are matched as prefixes
+    /// and all must appear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub q: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feed: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unread: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starred: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u32>,
+}
+
+/// Body for `POST /api/v1/pair`: a client asking to be paired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairRequest {
+    /// A name for the device, e.g. `"laptop"`. Shown when approving.
+    pub name: String,
+}
+
+/// Response to `POST /api/v1/pair`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairStart {
+    /// Short code to approve, e.g. `"K7-4QX"`. Show it to the user.
+    pub code: String,
+    /// Secret to poll `GET /api/v1/pair/{poll_id}` with. Keep it private.
+    pub poll_id: String,
+    /// Seconds until the request expires.
+    pub expires_in: u64,
+}
+
+/// Response to `GET /api/v1/pair/{poll_id}` once approved. Returned only once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairApproved {
+    /// The device's API token.
+    pub token: String,
+    /// The name it was registered under (made unique if needed).
+    pub name: String,
+}
+
+/// A pairing request waiting for approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPairing {
+    pub code: String,
+    pub name: String,
+    /// When it was requested (Unix seconds).
+    pub requested: i64,
+}
+
+/// A paired device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Device {
+    pub name: String,
+    /// The user it belongs to.
+    pub user: String,
+    pub created: i64,
+    pub last_seen: Option<i64>,
+}
+
+/// Optional body for approving a pairing. Only admins may name another
+/// user; by default the device goes to the approver's user.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApproveRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Response to approving a pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Approved {
+    /// The device's name.
+    pub name: String,
+    /// The user it was added to.
+    pub user: String,
+}
+
+/// A user, as `pressboxctl users` lists them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserInfo {
+    pub name: String,
+    pub admin: bool,
+    pub devices: u32,
+    pub feeds: u32,
+}
+
+/// Response to `GET /api/v1/me`: who this token belongs to.
+/// The API version this crate describes: the `1` in `/api/v1`.
+pub const API_VERSION: u32 = 1;
+
+/// `GET /api/v1/version`, which needs no token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Version {
+    /// pressboxd's version, e.g. `0.1.0`.
+    pub version: String,
+    /// The API version, as in `/api/v1`.
+    pub api: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Me {
+    pub user: String,
+    pub admin: bool,
+    /// The device's name, or `None` for the static token.
+    pub device: Option<String>,
+}
+
+/// Body for `POST /admin/devices`: create a device without pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewDeviceRequest {
+    pub name: String,
+    /// Required when there is more than one user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Response to creating a device directly (control socket only).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewDevice {
+    pub name: String,
+    pub user: String,
+    pub token: String,
+}
+
+/// Body for `POST /admin/backup`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRequest {
+    /// How many backups to keep, newest first. Older ones are deleted.
+    pub keep: u32,
+}
+
+/// Response to `POST /admin/backup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupResult {
+    pub path: String,
+    pub removed: Vec<String>,
+}
+
+/// Response to `GET /admin/status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Status {
+    /// Feed URLs being fetched (each once, however many users follow it).
+    pub feeds: u32,
+    pub archived_feeds: u32,
+    pub failing_feeds: u32,
+    pub items: u32,
+    pub users: u32,
+    pub devices: u32,
+    pub pending_pairings: u32,
+}
