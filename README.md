@@ -7,24 +7,24 @@ SPDX-License-Identifier: GPL-3.0-only
 
 # pressbox
 
-A self-hosted RSS/Atom/JSON Feed aggregator. You declare feeds (and the
-people using them) in your NixOS configuration, a small Rust server polls
-them, and a terminal client on NixOS and an
-[iOS app](https://github.com/chrisppy/pressbox-ios) share read and starred
-state through its API. Each client is paired with a short code; there is no
-website and no shared secret. [Birdland](https://github.com/chrisppy/birdland)'s
-bar can show the unread count.
+A self-hosted RSS/Atom/JSON Feed aggregator. You declare feeds (and the people
+using them) in your NixOS configuration, a small Rust server polls them, and a
+terminal client on NixOS and an
+[iOS app](https://github.com/chrisppy/pressbox-ios) share read and starred state
+through its API. Each client is paired with a short code; there is no website
+and no shared secret. [Birdland](https://github.com/chrisppy/birdland)'s bar can
+show the unread count.
 
 ```
- NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items, search index, devices)
- (services.pressbox.feeds)            │ HTTP API, one token per device
-                    ┌───────────────┼────────────────┐
-                pressbox      Birdland bar        iOS app
-                            pressboxctl (control socket, on the server)
+NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items, search index, devices)
+(services.pressbox.feeds)            │ HTTP API, one token per device
+                   ┌───────────────┼────────────────┐
+               pressbox      Birdland bar        iOS app
+                           pressboxctl (control socket, on the server)
 ```
 
 | Part | Path | What it is |
-| ------------------- | -------------------------- | ----------------------------------------- |
+| ------------------- | -------------------------------------------------------- | ------------------------------------- |
 | `pressboxd` | `crates/pressboxd` | Server: polling, storage, search, API |
 | `pressboxctl` | `crates/pressboxd/src/bin` | Pairing, devices, backups, OPML |
 | `pressbox-api` | `crates/pressbox-api` | JSON types shared by the Rust crates |
@@ -69,10 +69,10 @@ Then import `inputs.pressbox.nixosModules.default` and declare your feeds:
 
 ### Users
 
-For a household or friends, declare users. Everyone gets the shared `feeds`
-plus their own, with their own read and starred state, devices and pairings.
-Nobody sees another user's feeds or state, and a URL several people follow is
-fetched once.
+For a household or friends, declare users. Everyone gets the shared `feeds` plus
+their own, with their own read and starred state, devices and pairings. Nobody
+sees another user's feeds or state, and a URL several people follow is fetched
+once.
 
 ```nix
 {
@@ -87,9 +87,9 @@ fetched once.
 ```
 
 Without `users` there is a single admin user named `default`. When you first
-declare users, the existing data (read state, stars, devices) goes to the
-first admin. Removing a user deletes their devices and state. Users come only
-from the config; nobody signs up.
+declare users, the existing data (read state, stars, devices) goes to the first
+admin. Removing a user deletes their devices and state. Users come only from the
+config; nobody signs up.
 
 Moving from another reader? Export OPML from it and run
 `pressboxctl opml-to-nix subscriptions.opml > feeds.nix`, then
@@ -107,8 +107,8 @@ Feed ids (the attribute names) may contain letters, digits, `-` and `_`. The
 generated config is checked by `pressboxd --check` at build time, so a bad feed
 fails `nixos-rebuild`, not the service.
 
-Removing a feed (for everyone, or from one user's `feeds`) deletes its items
-for those users, except starred ones: the feed stays under "removed" in their
+Removing a feed (for everyone, or from one user's `feeds`) deletes its items for
+those users, except starred ones: the feed stays under "removed" in their
 clients until they unstar them. Adding it back resumes it.
 
 | Option | Default | Notes |
@@ -137,19 +137,20 @@ proxy with ACME works too.
 
 Every client gets its own token, and only its SHA-256 is stored. To pair:
 
-1. On the new client, start pairing: `pressbox pair`, or "Pair this
-   device" in the iOS app. It shows a code like `K7W-4QX`.
+1. On the new client, start pairing: `pressbox pair`, or "Pair this device" in
+   the iOS app. It shows a code like `K7W-4QX`.
 1. Approve it on the server with `sudo pressboxctl approve K7W-4QX --user anna`
-   (`--user` is needed once there is more than one user), or from a client
-   that is already paired: `pressbox approve K7W-4QX`, or iOS Settings. A device approved from a client goes to that
-   client's user; admins can name another (`pressbox approve CODE --user anna`, or the user field in iOS Settings).
+   (`--user` is needed once there is more than one user), or from a client that
+   is already paired: `pressbox approve K7W-4QX`, or iOS Settings. A device
+   approved from a client goes to that client's user; admins can name another
+   (`pressbox approve CODE --user anna`, or the user field in iOS Settings).
 1. The client picks up its token on its own. Codes expire after ten minutes.
 
 `pressboxctl devices` lists devices with their user and when each was last seen;
 `pressboxctl revoke <name>` locks one out. For a client that cannot pair (a
 script, say), `pressboxctl add-device <name> --user <user>` prints a token.
-`pressbox whoami` shows which user and device a machine is signed in as,
-and the server's version.
+`pressbox whoami` shows which user and device a machine is signed in as, and the
+server's version.
 
 Anyone who can reach the server can ask to pair, so requests are limited: 3
 waiting per client address and 50 in all. Behind a reverse proxy or
@@ -163,7 +164,7 @@ Runs as root on the server and talks to pressboxd over
 `/run/pressbox/control.sock`, which only root and the service can open.
 
 | Command | What it does |
-| --- | --- |
+| --------------------------------------- | ---------------------------------------------------------- |
 | `status` | Feeds (failing, removed), items, users, devices, pairings |
 | `users` | Users, admins, and their feed and device counts |
 | `pairings` | Pending pairing requests |
@@ -182,19 +183,19 @@ Runs as root on the server and talks to pressboxd over
 ### How feeds are fetched
 
 Each feed has its own schedule. Fetches are conditional (ETag and
-Last-Modified), and a server's `Cache-Control: max-age` can stretch the wait
-but never shorten it below the interval. A failing feed backs off: the delay
-doubles with each failure, up to a day, and `Retry-After` on a 429 or 503 is
-honored. `pressboxctl status` and the clients show failing feeds.
+Last-Modified), and a server's `Cache-Control: max-age` can stretch the wait but
+never shorten it below the interval. A failing feed backs off: the delay doubles
+with each failure, up to a day, and `Retry-After` on a 429 or 503 is honored.
+`pressboxctl status` and the clients show failing feeds.
 
 Feed HTML is cleaned when it is stored: scripts, styles, iframes, forms and
-event handlers are dropped, links get `rel="noopener noreferrer"`, relative
-URLs are made absolute, and tracking pixels (1×1 images and known tracker
-hosts) are removed. Every item's text is indexed for full-text search.
+event handlers are dropped, links get `rel="noopener noreferrer"`, relative URLs
+are made absolute, and tracking pixels (1×1 images and known tracker hosts) are
+removed. Every item's text is indexed for full-text search.
 
-Each feed keeps its newest `maxItemsPerFeed` items. With `maxAgeDays` set,
-items published longer ago are removed too, and not stored when a feed still
-lists them. Starred items are kept either way.
+Each feed keeps its newest `maxItemsPerFeed` items. With `maxAgeDays` set, items
+published longer ago are removed too, and not stored when a feed still lists
+them. Starred items are kept either way.
 
 ### systemd
 
@@ -203,15 +204,15 @@ pressboxd integrates with systemd directly:
 - **Readiness and status.** It is a `Type=notify` service, and
   `systemctl status pressbox` shows its own status line, e.g.
   `12 feeds, 2 users, 3 new at 14:30, 1 failing`.
-- **Watchdog.** It pings systemd's watchdog only while its database answers,
-  so a wedged server is restarted automatically.
+- **Watchdog.** It pings systemd's watchdog only while its database answers, so
+  a wedged server is restarted automatically.
 - **Credentials.** `tokenFile`, if set, reaches it through `LoadCredential`, so
   the secret can stay readable by root only.
 - **Journal.** Logs go straight to the journal with proper priorities:
   `journalctl -t pressboxd -p warning`.
 - **Backups.** `pressbox-backup.timer` runs `pressboxctl backup` on schedule.
-- **Socket activation (optional).** With `socketActivation = true`, systemd
-  owns the port, so it stays open across restarts.
+- **Socket activation (optional).** With `socketActivation = true`, systemd owns
+  the port, so it stays open across restarts.
 
 Outside systemd all of this is skipped and pressboxd runs the same by hand.
 
@@ -228,9 +229,9 @@ Import `inputs.pressbox.homeManagerModules.default`:
 }
 ```
 
-This writes `~/.config/pressbox/client.json` and installs `pressbox`.
-Pairing saves the token to `$XDG_STATE_HOME/pressbox/token`; set `tokenFile`
-only to use a token from somewhere else.
+This writes `~/.config/pressbox/client.json` and installs `pressbox`. Pairing
+saves the token to `$XDG_STATE_HOME/pressbox/token`; set `tokenFile` only to use
+a token from somewhere else.
 
 ### pressbox (terminal client)
 
@@ -241,7 +242,7 @@ only to use a token from somewhere else.
 requests, and `pressbox whoami` shows the signed-in user and device.
 
 | Key | Action |
-| --------------------- | --------------------------------------------- |
+| --------------------- | -------------------------------------------- |
 | `j` `k` / arrows | Move (scrolls in the reader) |
 | `Enter` / `l` / `Tab` | Open feed → item list → reader |
 | `Esc` / `h` | Back (clears a search first) |
@@ -257,10 +258,10 @@ requests, and `pressbox whoami` shows the signed-in user and device.
 ### In the Birdland bar
 
 [Birdland](https://github.com/chrisppy/birdland)'s bar, bullpen, has a `feeds`
-module showing the unread count. Click opens `pressbox` in your terminal,
-right click asks the server to fetch every feed, and new items send a
-notification. It reads the same `client.json` and token as `pressbox`, so
-pairing the TUI is all it needs:
+module showing the unread count. Click opens `pressbox` in your terminal, right
+click asks the server to fetch every feed, and new items send a notification. It
+reads the same `client.json` and token as `pressbox`, so pairing the TUI is all
+it needs:
 
 ```nix
 programs.birdland.bullpen.layout.right = [ "feeds" "clock" ]; # among your modules
@@ -271,21 +272,21 @@ Its options (`programs.birdland.bullpen.feeds.command`, `interval` and
 
 ## iOS
 
-The iOS app is in its own repo, [pressbox-ios](https://github.com/chrisppy/pressbox-ios),
-with its own releases. It needs iOS 18 and talks to the server through API v1;
-see its README for building it and what it can do.
+The iOS app is in its own repo,
+[pressbox-ios](https://github.com/chrisppy/pressbox-ios), with its own releases.
+It needs iOS 18 and talks to the server through API v1; see its README for
+building it and what it can do.
 
 ## API
 
 The API is versioned: everything lives under `/api/v1/`, except `/health`.
-Pairing routes and `version` need no token (pairing is how a client gets
-one); every other
-route needs `Authorization: Bearer <token>`, a paired device's token or the
-static `tokenFile` token. A token belongs to one user, and every answer is
-about that user's feeds and state. Timestamps are Unix seconds.
+Pairing routes and `version` need no token (pairing is how a client gets one);
+every other route needs `Authorization: Bearer <token>`, a paired device's token
+or the static `tokenFile` token. A token belongs to one user, and every answer
+is about that user's feeds and state. Timestamps are Unix seconds.
 
 | Method | Path | Body / query | Response |
-| --- | --- | --- | --- |
+| ------ | --------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------- |
 | GET | `/health` | | `ok` |
 | GET | `/api/v1/version` | | `{version, api}`, e.g. `{"version": "0.1.0", "api": 1}` |
 | POST | `/api/v1/pair` | `{"name": str}` | `{code, poll_id, expires_in}`; 429 when too many wait |
@@ -303,8 +304,8 @@ about that user's feeds and state. Timestamps are Unix seconds.
 | DELETE | `/api/v1/pairings/{code}` | | 204 |
 
 `q` matches every word as a prefix, in titles and text. With `q`, `unread` is
-usually left out so read items are found too. Breaking changes will go to a
-new version (`/api/v2/`), served alongside `v1` for a while.
+usually left out so read items are found too. Breaking changes will go to a new
+version (`/api/v2/`), served alongside `v1` for a while.
 
 ## Project layout
 
@@ -348,8 +349,8 @@ pressbox/
 └── README.md
 ```
 
-Files in `nix/` must be flake-parts modules, because devfmt imports every
-file there; that is why the NixOS and Home Manager modules live in `modules/`.
+Files in `nix/` must be flake-parts modules, because devfmt imports every file
+there; that is why the NixOS and Home Manager modules live in `modules/`.
 
 ## Development
 
@@ -361,19 +362,19 @@ nix flake check      # builds, module checks and a NixOS VM test
 cargo deny check     # advisories, licenses, duplicate crates, sources
 ```
 
-`cargo deny` also runs in CI on every push and weekly, so a new advisory
-against a dependency shows up without a code change. Its allowed licenses are
-in `deny.toml`; anything else needs a deliberate edit there.
+`cargo deny` also runs in CI on every push and weekly, so a new advisory against
+a dependency shows up without a code change. Its allowed licenses are in
+`deny.toml`; anything else needs a deliberate edit there.
 
-Changes are recorded in [CHANGELOG.md](CHANGELOG.md). A release bumps
-`version` in `Cargo.toml`,
-moves the changelog's entries under the new version, and is tagged `vX.Y.Z`.
+Changes are recorded in [CHANGELOG.md](CHANGELOG.md). A release bumps `version`
+in `Cargo.toml`, moves the changelog's entries under the new version, and is
+tagged `vX.Y.Z`.
 
 To run the server locally, write a `pressbox.toml` (same keys as the module
 generates: `listen`, `database`, `refresh_interval`, `max_items_per_feed`,
 `max_age_days`, `behind_proxy`, `control_socket`, `backup_dir`, `token_file`,
-`[feeds.<id>]` with `url`, `title`, `tags`, `refresh_interval`, `full_text`, and `[users.<name>]` with `admin` and
-`[users.<name>.feeds.<id>]`) and run
+`[feeds.<id>]` with `url`, `title`, `tags`, `refresh_interval`, `full_text`, and
+`[users.<name>]` with `admin` and `[users.<name>.feeds.<id>]`) and run
 `cargo run -p pressboxd -- -c pressbox.toml`. The control socket defaults to
 `pressbox.sock` next to the database: `pressboxctl -s ./pressbox.sock status`.
 
@@ -387,9 +388,8 @@ license in an SPDX header (`reuse lint` checks this, also in `nix flake check`).
   [GNU Affero General Public License v3.0 only](LICENSES/AGPL-3.0-only.txt). If
   you let others use a modified server over a network, you must offer them its
   source.
-- The terminal client (`pressbox`), the shared
-  `pressbox-api` types, the Home Manager module, and the build files and docs
-  are licensed under the
+- The terminal client (`pressbox`), the shared `pressbox-api` types, the Home
+  Manager module, and the build files and docs are licensed under the
   [GNU General Public License v3.0 only](LICENSES/GPL-3.0-only.txt).
 - The logo (`assets/logo.svg`) is licensed under
   [Creative Commons Attribution-ShareAlike 4.0](LICENSES/CC-BY-SA-4.0.txt).
@@ -400,5 +400,5 @@ licensed separately, under the Mozilla Public License 2.0.
 ### Name and logo
 
 The pressbox name and logo identify this project. The licenses above cover
-copyright, not trademarks: you're welcome to use the logo to refer to
-pressbox, but forks and derived projects must use their own name and logo.
+copyright, not trademarks: you're welcome to use the logo to refer to pressbox,
+but forks and derived projects must use their own name and logo.
