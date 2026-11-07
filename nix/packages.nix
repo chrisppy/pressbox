@@ -38,6 +38,12 @@ _: {
             pname
           ];
 
+          # reqwest (rustls) loads the system CA certificates when a client is
+          # built, and the build sandbox has none, so tests that build a client
+          # fail with "No CA certificates were loaded from the system".
+          # cacert's setup hook points SSL_CERT_FILE at its bundle.
+          nativeCheckInputs = [ pkgs.cacert ];
+
           meta = {
             inherit description license mainProgram;
             homepage = "https://github.com/chrisppy/pressbox";
