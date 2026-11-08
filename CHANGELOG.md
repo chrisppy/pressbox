@@ -12,6 +12,29 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
 `/api/v1`), which only changes on an incompatible change. The iOS app,
 [pressbox-ios](https://github.com/chrisppy/pressbox-ios), has its own releases.
 
+## [Unreleased]
+
+### Server
+
+- Item lists page by cursor: `GET /api/v1/items` takes `cursor` and returns
+  `next_cursor`, which stays fast deep into a list (a page after 4,900 items:
+  7.6 ms to 0.3 ms). `offset`/`next_offset` still work for older clients.
+- API responses are compressed (gzip, brotli) when the client accepts it.
+- Feed parsing, sanitizing and database work run off the async runtime, so a
+  large feed or a long write no longer holds up API requests.
+- Full articles are fetched in the background, at most four feeds at once,
+  instead of holding a feed-polling slot until every page has loaded.
+- Feed and article bodies are cut off at their size limit as they download,
+  even without a `Content-Length`.
+- Entries unchanged since the last fetch are no longer re-sanitized (a new
+  database column records each one's digest as sent), and per-feed pruning
+  only runs when something was added or `maxAgeDays` is set.
+
+### Terminal client
+
+- Pages by cursor, falling back to offsets with an older server; asks for
+  gzip responses.
+
 ## [0.1.0] - 2026-11-07
 
 The first release.

@@ -7,7 +7,10 @@
 //! A user's feeds are *subscriptions* to sources (with their own id, title
 //! and tags), and read/starred flags live in `item_state`, per user.
 
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeSet, HashMap},
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use pressbox_api::{Device, Feed, Item, ItemPage, ItemQuery, UserInfo};
@@ -170,6 +173,15 @@ const MIGRATIONS: &[&str] = &[
     r"
     ALTER TABLE subscriptions ADD COLUMN full_text INTEGER NOT NULL DEFAULT 0;
     ALTER TABLE items ADD COLUMN full_content TEXT;
+    ",
+    // 6: a digest of each item as the feed sent it, before sanitizing, so a
+    // re-fetch can skip sanitizing entries it has already stored. It joins
+    // the covering lookup index; '' (older rows) never matches, so those are
+    // sanitized once more and then get one.
+    r"
+    ALTER TABLE items ADD COLUMN source_digest TEXT NOT NULL DEFAULT '';
+    DROP INDEX items_lookup;
+    CREATE INDEX items_lookup ON items (source, guid, digest, published, source_digest);
     ",
 ];
 
@@ -598,6 +610,37 @@ impl Db {
     /// search index in step. Unchanged items (most of them, on most fetches)
     /// are not written at all. Returns how many items were new.
     pub fn upsert_items(&mut self, source: &str, now: i64, items: &[NewItem]) -> Result<usize> {
+        self.store_items(source, now, items.iter().map(|i| (i, "")))
+    }
+
+    /// The source digest of each stored item of a feed URL, by guid, to tell
+    /// which fetched entries are unchanged before sanitizing them.
+    pub fn source_digests(&self, source: &str) -> Result<HashMap<String, String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT guid, source_digest FROM items INDEXED BY items_lookup
+             WHERE source = ?1 AND source_digest != ''",
+        )?;
+        let rows = stmt.query_map([source], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Like `upsert_items`, also recording each item's source digest (see
+    /// `source_digests`).
+    pub fn upsert_fetched(
+        &mut self,
+        source: &str,
+        now: i64,
+        items: &[(NewItem, String)],
+    ) -> Result<usize> {
+        self.store_items(source, now, items.iter().map(|(i, d)| (i, d.as_str())))
+    }
+
+    fn store_items<'a>(
+        &mut self,
+        source: &str,
+        now: i64,
+        items: impl Iterator<Item = (&'a NewItem, &'a str)>,
+    ) -> Result<usize> {
         let tx = self.conn.transaction()?;
         let mut inserted = 0;
         {
@@ -605,26 +648,29 @@ impl Db {
             // use the unique (source, guid) index and then read the row, whose
             // later columns sit behind the large text in overflow pages.
             let mut existing = tx.prepare(
-                "SELECT id, digest, published FROM items INDEXED BY items_lookup
+                "SELECT id, digest, published, source_digest FROM items INDEXED BY items_lookup
                  WHERE source = ?1 AND guid = ?2",
             )?;
             let mut insert = tx.prepare(
                 "INSERT INTO items
-                    (source, guid, title, url, author, summary, content, published, digest)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING id",
+                    (source, guid, title, url, author, summary, content, published, digest,
+                     source_digest)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) RETURNING id",
             )?;
             let mut update = tx.prepare(
                 "UPDATE items SET title = ?2, url = ?3, author = ?4, summary = ?5, content = ?6,
-                    published = ?7, digest = ?8
+                    published = ?7, digest = ?8, source_digest = ?9
                  WHERE id = ?1 RETURNING NULLIF(full_content, '')",
             )?;
+            let mut set_source_digest =
+                tx.prepare("UPDATE items SET source_digest = ?2 WHERE id = ?1")?;
             let mut unindex = tx.prepare("DELETE FROM items_fts WHERE rowid = ?1")?;
             let mut index =
                 tx.prepare("INSERT INTO items_fts (rowid, title, body) VALUES (?1, ?2, ?3)")?;
-            for item in items {
-                let stored: Option<(i64, String, i64)> = existing
+            for (item, source_digest) in items {
+                let stored: Option<(i64, String, i64, String)> = existing
                     .query_row(params![source, item.guid], |r| {
-                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                     })
                     .optional()?;
                 let digest = digest(item);
@@ -642,16 +688,20 @@ impl Db {
                                 item.summary,
                                 item.content,
                                 published,
-                                digest
+                                digest,
+                                source_digest
                             ],
                             |r| r.get::<_, i64>(0),
                         )?;
                         (id, None)
                     }
-                    Some((id, stored_digest, published)) => {
+                    Some((id, stored_digest, published, stored_source)) => {
                         // An undated item keeps the time it was first seen.
                         let new_published = item.published.unwrap_or(published);
                         if stored_digest == digest && published == new_published {
+                            if !source_digest.is_empty() && stored_source != source_digest {
+                                set_source_digest.execute(params![id, source_digest])?;
+                            }
                             continue;
                         }
                         // The extracted article (if any) is kept, and stays
@@ -665,7 +715,8 @@ impl Db {
                                 item.summary,
                                 item.content,
                                 new_published,
-                                digest
+                                digest,
+                                source_digest
                             ],
                             |r| r.get(0),
                         )?;
@@ -807,6 +858,15 @@ impl Db {
             }
             args.push(Box::new(fts));
         }
+        // A cursor continues from where the last page ended, walking the
+        // index from there instead of counting past every earlier item.
+        let cursor = query.cursor.as_deref().map(parse_cursor).transpose()?;
+        let offset = if cursor.is_some() { 0 } else { offset };
+        if let Some((published, id)) = cursor {
+            clauses.push("(i.published, i.id) < (?, ?)");
+            args.push(Box::new(published));
+            args.push(Box::new(id));
+        }
         // Fetch one extra row to learn whether there is another page.
         args.push(Box::new(limit + 1));
         args.push(Box::new(offset));
@@ -819,11 +879,18 @@ impl Db {
         let mut items = stmt
             .query_map(params_from_iter(args.iter()), item_from_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        let next_offset = (items.len() > limit as usize).then(|| {
-            items.truncate(limit as usize);
-            offset + limit
-        });
-        Ok(ItemPage { items, next_offset })
+        let more = items.len() > limit as usize;
+        items.truncate(limit as usize);
+        let next_cursor = more
+            .then(|| items.last())
+            .flatten()
+            .map(|last| format!("{}.{}", last.published, last.id));
+        let next_offset = (more && cursor.is_none()).then_some(offset + limit);
+        Ok(ItemPage {
+            items,
+            next_cursor,
+            next_offset,
+        })
     }
 
     /// One item with its content, if the user may see it.
@@ -1091,15 +1158,20 @@ impl Db {
 
 /// A fingerprint of an item's text, to skip rewriting unchanged items.
 fn digest(item: &NewItem) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for part in [
+    hash_fields(&[
         Some(item.title.as_str()),
         item.url.as_deref(),
         item.author.as_deref(),
         item.summary.as_deref(),
         item.content.as_deref(),
-    ] {
+    ])
+}
+
+/// A short hex digest of a list of optional fields.
+pub fn hash_fields(parts: &[Option<&str>]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in parts {
         // A marker per field keeps ("ab", None) and ("a", "b") apart.
         match part {
             Some(text) => {
@@ -1117,6 +1189,26 @@ fn digest(item: &NewItem) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+
+/// A `next_cursor` from `items`: the (published, id) of the last item sent.
+fn parse_cursor(cursor: &str) -> Result<(i64, i64)> {
+    cursor
+        .rsplit_once('.')
+        .and_then(|(p, i)| Some((p.parse().ok()?, i.parse().ok()?)))
+        .ok_or_else(|| anyhow::Error::new(BadCursor))
+}
+
+/// A `cursor` that isn't one `items` gave out.
+#[derive(Debug)]
+pub struct BadCursor;
+
+impl std::fmt::Display for BadCursor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("invalid cursor")
+    }
+}
+
+impl std::error::Error for BadCursor {}
 
 /// Text indexed for search: the content without markup, or the summary
 /// when there is no content (a summary is usually the start of the content,
@@ -1209,6 +1301,103 @@ mod tests {
             content: Some("<p>content</p>".into()),
             published,
         }
+    }
+
+    #[test]
+    fn pages_by_cursor() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.sync(&config(&format!("[feeds.a]\nurl = \"{A}\"")))
+            .unwrap();
+        // Several items share each time, so the id has to break ties.
+        let items: Vec<_> = (0..25).map(|n| item(&n.to_string(), Some(n / 3))).collect();
+        db.upsert_items(A, 0, &items).unwrap();
+        let user = db.only_user().unwrap().unwrap().id;
+        let all: Vec<i64> = db
+            .items(
+                user,
+                &ItemQuery {
+                    limit: Some(100),
+                    ..ItemQuery::default()
+                },
+            )
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        assert_eq!(all.len(), 25);
+
+        let (mut seen, mut cursor, mut pages) = (Vec::new(), None, 0);
+        loop {
+            let page = db
+                .items(
+                    user,
+                    &ItemQuery {
+                        limit: Some(4),
+                        // Ignored when there is a cursor.
+                        offset: cursor.is_some().then_some(3),
+                        cursor,
+                        ..ItemQuery::default()
+                    },
+                )
+                .unwrap();
+            pages += 1;
+            if pages > 1 {
+                assert_eq!(page.next_offset, None, "cursor pages give cursors");
+            }
+            seen.extend(page.items.iter().map(|i| i.id));
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(seen, all, "every item once, in order");
+        assert_eq!(pages, 7);
+
+        let first = db
+            .items(
+                user,
+                &ItemQuery {
+                    limit: Some(4),
+                    ..ItemQuery::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(first.next_offset, Some(4), "offset paging still works");
+        assert!(first.next_cursor.is_some());
+
+        for bad in ["", "x", "1", "1.x", "a.2"] {
+            let err = db
+                .items(
+                    user,
+                    &ItemQuery {
+                        cursor: Some(bad.into()),
+                        ..ItemQuery::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(err.is::<BadCursor>(), "{bad:?}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn source_digests_are_kept() {
+        let mut db = Db::open_in_memory().unwrap();
+        db.sync(&config(&format!("[feeds.a]\nurl = \"{A}\"")))
+            .unwrap();
+        let one = (item("1", Some(1)), "d1".to_owned());
+        db.upsert_fetched(A, 0, std::slice::from_ref(&one)).unwrap();
+        assert_eq!(db.source_digests(A).unwrap()["1"], "d1");
+
+        // Same text, new source digest (say, after an upgrade): recorded
+        // without rewriting the item.
+        let again = (one.0.clone(), "d2".to_owned());
+        assert_eq!(db.upsert_fetched(A, 0, &[again]).unwrap(), 0);
+        assert_eq!(db.source_digests(A).unwrap()["1"], "d2");
+
+        // Items stored without one aren't listed, so they get sanitized.
+        db.upsert_items(A, 0, &[item("2", Some(2))]).unwrap();
+        assert!(!db.source_digests(A).unwrap().contains_key("2"));
     }
 
     const A: &str = "https://a.example/feed";
@@ -1905,6 +2094,27 @@ mod bench {
                 &ItemQuery {
                     limit: Some(100),
                     offset: Some(4900),
+                    ..ItemQuery::default()
+                },
+            )
+            .unwrap();
+        });
+        let cursor = db
+            .items(
+                u,
+                &ItemQuery {
+                    limit: Some(4900),
+                    ..ItemQuery::default()
+                },
+            )
+            .unwrap()
+            .next_cursor;
+        time("items page 50 (cursor after 4900)", &mut || {
+            db.items(
+                u,
+                &ItemQuery {
+                    limit: Some(100),
+                    cursor: cursor.clone(),
                     ..ItemQuery::default()
                 },
             )

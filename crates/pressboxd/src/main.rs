@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 use std::{
+    collections::HashSet,
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
@@ -9,7 +10,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
 mod admin;
@@ -53,6 +54,11 @@ pub struct AppState {
     /// Items published longer ago than this are removed (unless starred).
     max_age_days: Option<u32>,
     pairings: pairing::Pairings,
+    /// Feeds whose full articles are being fetched, so a feed has at most
+    /// one such task at a time.
+    articles_running: Mutex<HashSet<String>>,
+    /// Limits article fetching across feeds, apart from feed polling.
+    article_slots: Semaphore,
     backup_dir: PathBuf,
     /// Trust `X-Forwarded-For` from a reverse proxy for client addresses.
     behind_proxy: bool,
@@ -70,14 +76,16 @@ impl AppState {
             max_items_per_feed,
             max_age_days: None,
             pairings: pairing::Pairings::default(),
+            articles_running: Mutex::default(),
+            article_slots: Semaphore::const_new(fetch::ARTICLE_TASKS),
             backup_dir: PathBuf::from("backups"),
             behind_proxy: false,
         })
     }
 
     /// Makes every feed due and wakes the scheduler.
-    pub fn request_refresh(&self) {
-        if let Err(e) = self.db().force_refresh() {
+    pub async fn request_refresh(self: &Arc<Self>) {
+        if let Err(e) = self.write(|db| db.force_refresh()).await {
             tracing::warn!("forcing a refresh: {e:#}");
         }
         self.refresh.notify_one();
@@ -117,6 +125,28 @@ impl AppState {
         self.readers[start % self.readers.len()]
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Runs `f` on a read connection on the blocking pool. SQLite calls
+    /// block, and a lock may have to wait, so async code goes through here
+    /// (or `write`) rather than holding up a runtime thread.
+    pub async fn read<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Db) -> Result<T> + Send + 'static,
+    {
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || f(&state.reader())).await?
+    }
+
+    /// Runs `f` on the writer connection on the blocking pool; see `read`.
+    pub async fn write<T, F>(self: &Arc<Self>, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Db) -> Result<T> + Send + 'static,
+    {
+        let state = self.clone();
+        tokio::task::spawn_blocking(move || f(&mut state.db())).await?
     }
 }
 
@@ -220,13 +250,13 @@ async fn schedule(state: Arc<AppState>, default_interval: u64) {
         if let Some(stats) = fetch::run_due(state.clone(), default_interval).await {
             last = Some((stats, chrono::Local::now()));
         }
-        if let Ok(counts) = state.reader().counts() {
+        if let Ok(counts) = state.read(|db| db.counts()).await {
             systemd::status(&status_line(&counts, last));
         }
         let now = fetch::now();
         let next = state
-            .reader()
-            .next_due()
+            .read(|db| db.next_due())
+            .await
             .ok()
             .flatten()
             .unwrap_or(now + 300);

@@ -75,7 +75,8 @@ pub struct App {
     pub feed_row: usize,
     pub items: Vec<Item>,
     pub item_row: usize,
-    pub next_offset: Option<u32>,
+    /// Where the next page starts, if there is one.
+    pub next_page: Option<NextPage>,
     pub reader: Option<Reader>,
     pub focus: Pane,
     pub unread_only: bool,
@@ -86,6 +87,23 @@ pub struct App {
     pub editing: Option<String>,
 }
 
+/// Where the next page of items starts: a cursor, or an offset from a server
+/// too old to give cursors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NextPage {
+    Cursor(String),
+    Offset(u32),
+}
+
+impl NextPage {
+    fn of(page: &ItemPage) -> Option<Self> {
+        page.next_cursor
+            .clone()
+            .map(Self::Cursor)
+            .or(page.next_offset.map(Self::Offset))
+    }
+}
+
 impl App {
     pub fn new() -> Self {
         Self {
@@ -93,7 +111,7 @@ impl App {
             feed_row: ALL_ROW,
             items: Vec::new(),
             item_row: 0,
-            next_offset: None,
+            next_page: None,
             reader: None,
             focus: Pane::Feeds,
             unread_only: true,
@@ -120,7 +138,7 @@ impl App {
             .and_then(|i| self.feeds.get(i))
     }
 
-    fn query(&self, offset: Option<u32>) -> ItemQuery {
+    fn query(&self, from: Option<&NextPage>) -> ItemQuery {
         let starred = self.feed_row == STARRED_ROW;
         ItemQuery {
             feed: self.selected_feed().map(|f| f.id.clone()),
@@ -128,7 +146,14 @@ impl App {
             unread: (self.unread_only && !starred && self.search.is_none()).then_some(true),
             q: self.search.clone(),
             limit: Some(PAGE),
-            offset,
+            cursor: match from {
+                Some(NextPage::Cursor(c)) => Some(c.clone()),
+                _ => None,
+            },
+            offset: match from {
+                Some(NextPage::Offset(o)) => Some(*o),
+                _ => None,
+            },
             ..Default::default()
         }
     }
@@ -145,17 +170,23 @@ impl App {
 
     fn load_items(&mut self, backend: &impl Backend) -> Result<()> {
         let page = backend.items(&self.query(None))?;
+        self.next_page = NextPage::of(&page);
         self.items = page.items;
-        self.next_offset = page.next_offset;
         self.item_row = self.item_row.min(self.items.len().saturating_sub(1));
         Ok(())
     }
 
     fn load_more(&mut self, backend: &impl Backend) -> Result<()> {
-        if let Some(offset) = self.next_offset {
-            let page = backend.items(&self.query(Some(offset)))?;
+        if let Some(from) = self.next_page.take() {
+            let page = match backend.items(&self.query(Some(&from))) {
+                Ok(page) => page,
+                Err(e) => {
+                    self.next_page = Some(from);
+                    return Err(e);
+                }
+            };
+            self.next_page = NextPage::of(&page);
             self.items.extend(page.items);
-            self.next_offset = page.next_offset;
         }
         Ok(())
     }
@@ -468,6 +499,7 @@ mod tests {
                 .collect();
             Ok(ItemPage {
                 items,
+                next_cursor: None,
                 next_offset: None,
             })
         }

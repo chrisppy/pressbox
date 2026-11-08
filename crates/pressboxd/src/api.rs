@@ -41,10 +41,11 @@ use pressbox_api::{
     PendingPairing, Updated, Version,
 };
 use serde_json::json;
+use tower_http::compression::CompressionLayer;
 
 use crate::{
     AppState,
-    db::AuthUser,
+    db::{AuthUser, BadCursor},
     fetch::now,
     pairing::{PollState, StartError, hash_token},
 };
@@ -72,6 +73,9 @@ pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(|| async { "ok" }))
         .nest("/api/v1", v1)
+        // Item HTML and long lists compress several times over; clients
+        // that don't ask for it get plain responses.
+        .layer(CompressionLayer::new())
         .with_state(state)
 }
 
@@ -136,13 +140,15 @@ async fn auth(State(state): State<Arc<AppState>>, mut req: Request, next: Next) 
     // Looked up on the read pool; the writer is only needed, at most once a
     // minute per device, to record when it was last seen.
     let user = if static_ok {
-        state.reader().static_token_user()
+        state.read(|db| db.static_token_user()).await
     } else {
         let hash = hash_token(given);
-        let found = state.reader().find_device(&hash, now());
+        let lookup = hash.clone();
+        let found = state.read(move |db| db.find_device(&lookup, now())).await;
         match found {
             Ok(Some((user, stale))) => {
-                if stale && let Err(e) = state.db().touch_device(&hash, now()) {
+                if stale && let Err(e) = state.write(move |db| db.touch_device(&hash, now())).await
+                {
                     tracing::warn!("recording last_seen: {e:#}");
                 }
                 Ok(Some(user))
@@ -178,7 +184,7 @@ async fn feeds(
     State(state): State<Arc<AppState>>,
     Extension(user): User,
 ) -> ApiResult<Json<Vec<Feed>>> {
-    Ok(Json(state.reader().feeds(user.id)?))
+    Ok(Json(state.read(move |db| db.feeds(user.id)).await?))
 }
 
 async fn items(
@@ -186,7 +192,11 @@ async fn items(
     Extension(user): User,
     Query(query): Query<ItemQuery>,
 ) -> ApiResult<Json<ItemPage>> {
-    Ok(Json(state.reader().items(user.id, &query)?))
+    match state.read(move |db| db.items(user.id, &query)).await {
+        Ok(page) => Ok(Json(page)),
+        Err(e) if e.is::<BadCursor>() => Err(ApiError::BadRequest("invalid cursor")),
+        Err(e) => Err(e.into()),
+    }
 }
 
 async fn item(
@@ -195,8 +205,8 @@ async fn item(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<Item>> {
     state
-        .db()
-        .item(user.id, id)?
+        .write(move |db| db.item(user.id, id))
+        .await?
         .map(Json)
         .ok_or(ApiError::NotFound)
 }
@@ -207,7 +217,11 @@ async fn set_read(
     Path(id): Path<i64>,
     Json(flag): Json<Flag>,
 ) -> ApiResult<StatusCode> {
-    found(state.db().set_read(user.id, id, flag.value)?)
+    found(
+        state
+            .write(move |db| db.set_read(user.id, id, flag.value))
+            .await?,
+    )
 }
 
 async fn set_starred(
@@ -216,7 +230,11 @@ async fn set_starred(
     Path(id): Path<i64>,
     Json(flag): Json<Flag>,
 ) -> ApiResult<StatusCode> {
-    found(state.db().set_starred(user.id, id, flag.value)?)
+    found(
+        state
+            .write(move |db| db.set_starred(user.id, id, flag.value))
+            .await?,
+    )
 }
 
 pub fn found(changed: bool) -> ApiResult<StatusCode> {
@@ -233,14 +251,14 @@ async fn read_all(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Updated>> {
     let updated = state
-        .db()
-        .mark_feed_read(user.id, &id)?
+        .write(move |db| db.mark_feed_read(user.id, &id))
+        .await?
         .ok_or(ApiError::NotFound)?;
     Ok(Json(Updated { updated }))
 }
 
 async fn refresh(State(state): State<Arc<AppState>>) -> StatusCode {
-    state.request_refresh();
+    state.request_refresh().await;
     StatusCode::ACCEPTED
 }
 
@@ -462,6 +480,37 @@ mod tests {
         );
         let (status, _) = call(&s, "POST", "/api/v1/refresh", None, T).await;
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn responses_are_compressed_when_asked() {
+        let s = state();
+        let get = |encoding: Option<&str>| {
+            let mut req =
+                Request::get("/api/v1/items/1").header(AUTHORIZATION, "Bearer static-token");
+            if let Some(e) = encoding {
+                req = req.header("accept-encoding", e);
+            }
+            router(s.clone()).oneshot(req.body(Body::empty()).unwrap())
+        };
+        let resp = get(Some("gzip")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-encoding"], "gzip");
+        let resp = get(Some("br")).await.unwrap();
+        assert_eq!(resp.headers()["content-encoding"], "br");
+        let resp = get(None).await.unwrap();
+        assert!(resp.headers().get("content-encoding").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_bad_cursor_is_400() {
+        let s = state();
+        let (status, body) = call(&s, "GET", "/api/v1/items?cursor=nope", None, T).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (status, body) = call(&s, "GET", "/api/v1/items?limit=1", None, T).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: ItemPage = serde_json::from_str(&body).unwrap();
+        assert_eq!(page.next_cursor, None, "one item, one page");
     }
 
     #[tokio::test]

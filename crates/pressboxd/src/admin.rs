@@ -59,7 +59,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/admin/refresh",
             post(|State(state): State<Arc<AppState>>| async move {
-                state.request_refresh();
+                state.request_refresh().await;
                 StatusCode::ACCEPTED
             }),
         )
@@ -164,7 +164,8 @@ async fn backup(
         chrono::Local::now().format("%Y%m%dT%H%M%S%.3f")
     );
     let path = dir.join(name);
-    state.db().backup_to(&path)?;
+    let target = path.clone();
+    state.write(move |db| db.backup_to(&target)).await?;
     let removed = prune_backups(&dir, req.keep.max(1))?;
     tracing::info!("backed up to {}", path.display());
     Ok(Json(BackupResult {

@@ -14,6 +14,10 @@ use std::{borrow::Cow, sync::LazyLock};
 use ammonia::{Builder, Url, UrlRelative};
 use regex::Regex;
 
+/// Changes whenever sanitizing might: stored entries are re-sanitized once
+/// after an upgrade rather than kept as an older version cleaned them.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// `<img>` tags declaring a zero or one pixel width or height.
 static PIXEL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(

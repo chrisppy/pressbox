@@ -127,7 +127,7 @@ fn draw_items(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let focused = app.focus == Pane::Items;
-    let more = if app.next_offset.is_some() { "+" } else { "" };
+    let more = if app.next_page.is_some() { "+" } else { "" };
     let title = if let Some(q) = &app.search {
         format!(" Search {q:?}: {}{more} (esc clears) ", app.items.len())
     } else {

@@ -57,7 +57,12 @@ pub struct Item {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemPage {
     pub items: Vec<Item>,
-    /// Pass as `offset` to get the next page; `None` on the last page.
+    /// Pass as `cursor` to get the next page; `None` on the last page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    /// Pass as `offset` to get the next page; `None` on the last page, and
+    /// when paging by `cursor`. Kept for older clients; prefer `next_cursor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<u32>,
 }
 
@@ -90,8 +95,13 @@ pub struct ItemQuery {
     pub starred: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
+    /// Skips this many items. Slow deep into a long list; prefer `cursor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<u32>,
+    /// Starts after the item a previous page's `next_cursor` names. Opaque;
+    /// takes precedence over `offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Body for `POST /api/v1/pair`: a client asking to be paired.

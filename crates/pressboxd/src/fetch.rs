@@ -8,7 +8,7 @@
 //! max-age` asks for that. After a failure the delay doubles each time (up to
 //! a day), and a `Retry-After` from a 429 or 503 is honored.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::{
     AppState,
-    db::{FetchResult, FetchTarget, NewItem},
+    db::{self, FetchResult, FetchTarget, NewItem},
     sanitize,
 };
 
@@ -31,6 +31,8 @@ const MAX_BODY: usize = 20 * 1024 * 1024;
 const CONCURRENCY: usize = 8;
 /// Largest article page fetched for full text.
 const MAX_PAGE: usize = 5 * 1024 * 1024;
+/// Feeds whose articles are fetched at once (each fetches its pages in turn).
+pub const ARTICLE_TASKS: usize = 4;
 /// Article pages fetched per feed per round; the rest wait for the next one.
 const ARTICLES_PER_ROUND: u32 = 10;
 /// Less text than this is not taken to be an article.
@@ -115,7 +117,10 @@ pub struct RefreshStats {
 
 /// Fetches every feed that is due, a few at a time. `None` if none was due.
 pub async fn run_due(state: Arc<AppState>, default_interval: u64) -> Option<RefreshStats> {
-    let targets = match state.db().due_targets(now(), default_interval) {
+    let targets = match state
+        .read(move |db| db.due_targets(now(), default_interval))
+        .await
+    {
         Ok(t) if t.is_empty() => return None,
         Ok(t) => t,
         Err(e) => {
@@ -125,10 +130,7 @@ pub async fn run_due(state: Arc<AppState>, default_interval: u64) -> Option<Refr
     };
     let fetched = targets.len();
     let results: Vec<Option<usize>> = futures::stream::iter(targets)
-        .map(|target| {
-            let state = state.clone();
-            async move { refresh_one(&state, target).await }
-        })
+        .map(|target| refresh_one(state.clone(), target))
         .buffer_unordered(CONCURRENCY)
         .collect()
         .await;
@@ -145,7 +147,7 @@ pub async fn run_due(state: Arc<AppState>, default_interval: u64) -> Option<Refr
 }
 
 /// Returns the number of new items, or `None` if the feed failed.
-async fn refresh_one(state: &AppState, target: FetchTarget) -> Option<usize> {
+async fn refresh_one(state: Arc<AppState>, target: FetchTarget) -> Option<usize> {
     let now = now();
     let (mut result, items, outcome) = match poll(&state.http, &target, now).await {
         Ok(Polled::Fresh {
@@ -184,22 +186,15 @@ async fn refresh_one(state: &AppState, target: FetchTarget) -> Option<usize> {
     let cutoff = state
         .max_age_days
         .map(|days| now - i64::from(days) * 86_400);
-    let items: Vec<_> = match cutoff {
-        Some(cutoff) => items
-            .into_iter()
-            .filter(|i| i.published.is_none_or(|p| p >= cutoff))
-            .collect(),
-        None => items,
+    let url = target.url.clone();
+    let stored = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || store(&state, &url, now, cutoff, items, &result))
+            .await
+            .unwrap_or_else(|e| Err(e.into()))
     };
-    let stored = (|| -> Result<usize> {
-        let mut db = state.db();
-        let new = db.upsert_items(&target.url, now, &items)?;
-        db.prune(&target.url, state.max_items_per_feed, cutoff)?;
-        db.record_fetch(&target.url, now, &result)?;
-        Ok(new)
-    })();
     if target.full_text && !failed {
-        fetch_articles(state, &target.url).await;
+        spawn_articles(&state, target.url.clone());
     }
     match stored {
         Ok(new) if !failed => Some(new),
@@ -211,10 +206,86 @@ async fn refresh_one(state: &AppState, target: FetchTarget) -> Option<usize> {
     }
 }
 
+/// Stores a poll's entries and outcome. Blocking: sanitizes and writes.
+/// Entries stored before, unchanged, are skipped without sanitizing them.
+fn store(
+    state: &AppState,
+    url: &str,
+    now: i64,
+    cutoff: Option<i64>,
+    items: Vec<RawItem>,
+    result: &FetchResult,
+) -> Result<usize> {
+    let items: Vec<_> = items
+        .into_iter()
+        .filter(|i| cutoff.is_none_or(|c| i.published.is_none_or(|p| p >= c)))
+        .collect();
+    // Read before taking the writer, which the reader falls back to when
+    // there is no pool.
+    let known = if items.is_empty() {
+        HashMap::new()
+    } else {
+        state.reader().source_digests(url)?
+    };
+    let fresh: Vec<_> = items
+        .into_iter()
+        .filter_map(|raw| {
+            let digest = raw.digest();
+            (known.get(&raw.guid) != Some(&digest)).then(|| (raw.sanitize(), digest))
+        })
+        .collect();
+    let mut db = state.db();
+    let new = db.upsert_fetched(url, now, &fresh)?;
+    // Only new items can push a feed over its limit; age needs a check
+    // every time.
+    if new > 0 || cutoff.is_some() {
+        db.prune(url, state.max_items_per_feed, cutoff)?;
+    }
+    db.record_fetch(url, now, result)?;
+    Ok(new)
+}
+
+/// Starts fetching a feed's full articles in the background, unless that is
+/// already under way, so slow article pages never hold up feed polling.
+fn spawn_articles(state: &Arc<AppState>, feed: String) {
+    let running = || {
+        state
+            .articles_running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    };
+    if !running().insert(feed.clone()) {
+        return;
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        /// Forgets the feed when the task ends, however it ends.
+        struct Done<'a>(&'a AppState, &'a str);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .articles_running
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(self.1);
+            }
+        }
+        let _done = Done(&state, &feed);
+        let Ok(_slot) = state.article_slots.acquire().await else {
+            return;
+        };
+        fetch_articles(&state, &feed).await;
+    });
+}
+
 /// Fetches the pages of a feed's newest items that don't have their full
 /// article yet, a few per round, and stores what can be extracted.
-async fn fetch_articles(state: &AppState, feed: &str) {
-    let pending = match state.db().full_text_pending(feed, ARTICLES_PER_ROUND) {
+async fn fetch_articles(state: &Arc<AppState>, feed: &str) {
+    let source = feed.to_owned();
+    let pending = match state
+        .read(move |db| db.full_text_pending(&source, ARTICLES_PER_ROUND))
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             warn!(feed, "listing articles to fetch: {e:#}");
@@ -225,7 +296,7 @@ async fn fetch_articles(state: &AppState, feed: &str) {
         let article = match fetch_page(&state.http, &url).await {
             Ok(html) => {
                 let page = url.clone();
-                tokio::task::spawn_blocking(move || extract(&html, &page))
+                tokio::task::spawn_blocking(move || extract(&String::from_utf8_lossy(&html), &page))
                     .await
                     .ok()
                     .flatten()
@@ -238,13 +309,16 @@ async fn fetch_articles(state: &AppState, feed: &str) {
         if article.is_none() {
             info!(feed, url, "no article found; keeping the feed's text");
         }
-        if let Err(e) = state.db().store_full_text(id, article.as_deref()) {
+        if let Err(e) = state
+            .write(move |db| db.store_full_text(id, article.as_deref()))
+            .await
+        {
             warn!(feed, url, "storing article: {e:#}");
         }
     }
 }
 
-async fn fetch_page(http: &reqwest::Client, url: &str) -> Result<String, String> {
+async fn fetch_page(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -257,14 +331,30 @@ async fn fetch_page(http: &reqwest::Client, url: &str) -> Result<String, String>
     if !html {
         return Err("not an HTML page".to_owned());
     }
-    if resp.content_length().is_some_and(|n| n > MAX_PAGE as u64) {
-        return Err(format!("page is larger than {MAX_PAGE} bytes"));
+    read_limited(resp, MAX_PAGE, "page").await
+}
+
+/// Reads a response body, giving up as soon as it passes `max` bytes rather
+/// than after reading it all: `Content-Length` may be missing (chunked or
+/// compressed responses) or wrong.
+async fn read_limited(
+    mut resp: reqwest::Response,
+    max: usize,
+    what: &str,
+) -> Result<Vec<u8>, String> {
+    let too_large = || format!("{what} is larger than {max} bytes");
+    let expected = resp.content_length().unwrap_or(0);
+    if expected > max as u64 {
+        return Err(too_large());
     }
-    let body = resp.bytes().await.map_err(|e| e.to_string())?;
-    if body.len() > MAX_PAGE {
-        return Err(format!("page is larger than {MAX_PAGE} bytes"));
+    let mut body = Vec::with_capacity(usize::try_from(expected).unwrap_or(0));
+    while let Some(chunk) = resp.chunk().await.map_err(|e| e.to_string())? {
+        if body.len() + chunk.len() > max {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
     }
-    Ok(String::from_utf8_lossy(&body).into_owned())
+    Ok(body)
 }
 
 /// The main content of an HTML page, sanitized, if there is enough of it to
@@ -283,7 +373,7 @@ pub fn extract(html: &str, url: &str) -> Option<String> {
 enum Polled {
     Fresh {
         result: FetchResult,
-        items: Vec<NewItem>,
+        items: Vec<RawItem>,
         max_age: Option<u64>,
     },
     NotModified {
@@ -338,14 +428,12 @@ async fn poll(http: &reqwest::Client, target: &FetchTarget, now: i64) -> Result<
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
     };
-    if resp.content_length().is_some_and(|n| n > MAX_BODY as u64) {
-        return Err(format!("feed is larger than {MAX_BODY} bytes").into());
-    }
-    let body = resp.bytes().await?;
-    if body.len() > MAX_BODY {
-        return Err(format!("feed is larger than {MAX_BODY} bytes").into());
-    }
-    let (mut result, items) = parse(&body, Some(&target.url)).map_err(|e| format!("{e:#}"))?;
+    let body = read_limited(resp, MAX_BODY, "feed").await?;
+    // Parsing a large feed takes a while; keep it off the runtime threads.
+    let uri = target.url.clone();
+    let (mut result, items) = tokio::task::spawn_blocking(move || parse_raw(&body, Some(&uri)))
+        .await?
+        .map_err(|e| format!("{e:#}"))?;
     result.etag = header(ETAG);
     result.last_modified = header(LAST_MODIFIED);
     Ok(Polled::Fresh {
@@ -355,8 +443,66 @@ async fn poll(http: &reqwest::Client, target: &FetchTarget, now: i64) -> Result<
     })
 }
 
+/// An entry as the feed sent it, not yet sanitized.
+#[derive(Debug, Clone)]
+pub struct RawItem {
+    pub guid: String,
+    title: Option<String>,
+    url: Option<String>,
+    author: Option<String>,
+    summary: Option<String>,
+    content: Option<String>,
+    pub published: Option<i64>,
+    /// What relative links resolve against.
+    base: String,
+}
+
+impl RawItem {
+    /// Identifies the entry's text as sent: equal digests mean sanitizing
+    /// would give what is already stored.
+    pub fn digest(&self) -> String {
+        let published = self.published.map(|p| p.to_string());
+        db::hash_fields(&[
+            Some(self.guid.as_str()),
+            self.title.as_deref(),
+            self.url.as_deref(),
+            self.author.as_deref(),
+            self.summary.as_deref(),
+            self.content.as_deref(),
+            published.as_deref(),
+            Some(self.base.as_str()),
+            Some(sanitize::VERSION),
+        ])
+    }
+
+    pub fn sanitize(self) -> NewItem {
+        let base = (!self.base.is_empty()).then_some(self.base.as_str());
+        NewItem {
+            title: self
+                .title
+                .map(|t| sanitize::text(&t))
+                .filter(|t| !t.is_empty())
+                .or_else(|| self.url.clone())
+                .unwrap_or_else(|| "(untitled)".to_owned()),
+            summary: self.summary.map(|s| sanitize::html(&s, base)),
+            content: self.content.map(|c| sanitize::html(&c, base)),
+            guid: self.guid,
+            url: self.url,
+            author: self.author,
+            published: self.published,
+        }
+    }
+}
+
 /// Parses RSS, Atom or JSON Feed into feed metadata and sanitized items.
+#[cfg(test)]
 pub fn parse(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<NewItem>)> {
+    let (result, items) = parse_raw(body, uri)?;
+    Ok((result, items.into_iter().map(RawItem::sanitize).collect()))
+}
+
+/// Parses RSS, Atom or JSON Feed into feed metadata and unsanitized items.
+pub fn parse_raw(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<RawItem>)> {
     let feed = feed_rs::parser::Builder::new()
         .base_uri(uri)
         .build()
@@ -372,23 +518,13 @@ pub fn parse(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<NewItem
                 .find(|l| l.rel.as_deref().is_none_or(|r| r == "alternate"))
                 .or_else(|| e.links.first())
                 .map(|l| l.href.clone());
-            let title = e
-                .title
-                .map(|t| sanitize::text(&t.content))
-                .filter(|t| !t.is_empty())
-                .or_else(|| url.clone())
-                .unwrap_or_else(|| "(untitled)".to_owned());
-            let base = sanitize::base_url(url.as_deref(), feed_url);
-            let base = (!base.is_empty()).then_some(base.as_str());
-            NewItem {
+            RawItem {
+                base: sanitize::base_url(url.as_deref(), feed_url),
                 guid: e.id,
-                title,
+                title: e.title.map(|t| t.content),
                 author: e.authors.into_iter().find_map(|p| p.name),
-                summary: e.summary.map(|s| sanitize::html(&s.content, base)),
-                content: e
-                    .content
-                    .and_then(|c| c.body)
-                    .map(|b| sanitize::html(&b, base)),
+                summary: e.summary.map(|s| s.content),
+                content: e.content.and_then(|c| c.body),
                 published: e.published.or(e.updated).map(|d| d.timestamp()),
                 url,
             }
@@ -585,6 +721,89 @@ mod tests {
         assert_eq!(meta.title.as_deref(), Some("RSS 1.0"));
         assert_eq!(items[0].title, "RDF item");
         assert_eq!(items[0].url.as_deref(), Some("https://example.net/a"));
+    }
+
+    #[test]
+    fn stores_and_skips_by_source_digest() {
+        const FEED: &str = "https://example.com/feed.xml";
+        let rss = |second: &str| {
+            format!(
+                r#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>
+                  <item><title>First</title><guid>urn:1</guid>
+                    <description>&lt;p&gt;one&lt;/p&gt;</description></item>
+                  <item><title>{second}</title><guid>urn:2</guid></item>
+                </channel></rss>"#
+            )
+        };
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        db.sync(&crate::config::Config::parse(&format!("[feeds.a]\nurl = \"{FEED}\"")).unwrap())
+            .unwrap();
+        let user = db.only_user().unwrap().unwrap().id;
+        let state = AppState::new(db, None, 100).unwrap();
+        let titles = || -> Vec<String> {
+            let page = state
+                .reader()
+                .items(user, &pressbox_api::ItemQuery::default())
+                .unwrap();
+            let mut t: Vec<_> = page.items.into_iter().map(|i| i.title).collect();
+            t.sort();
+            t
+        };
+        let digests = |items: &[RawItem]| -> HashMap<String, String> {
+            items.iter().map(|i| (i.guid.clone(), i.digest())).collect()
+        };
+
+        let (result, items) = parse_raw(rss("Second").as_bytes(), Some(FEED)).unwrap();
+        let expected = digests(&items);
+        assert_eq!(store(&state, FEED, 0, None, items, &result).unwrap(), 2);
+        assert_eq!(state.reader().source_digests(FEED).unwrap(), expected);
+        assert_eq!(titles(), ["First", "Second"]);
+
+        // Unchanged entries match what is stored, so `store` skips them.
+        let (result, items) = parse_raw(rss("Second").as_bytes(), Some(FEED)).unwrap();
+        assert_eq!(digests(&items), expected);
+        assert_eq!(store(&state, FEED, 0, None, items, &result).unwrap(), 0);
+
+        // A changed one is sanitized and stored.
+        let (result, items) =
+            parse_raw(rss("Second &lt;b&gt;edit&lt;/b&gt;").as_bytes(), Some(FEED)).unwrap();
+        let changed = digests(&items);
+        assert_ne!(changed["urn:2"], expected["urn:2"]);
+        assert_eq!(store(&state, FEED, 0, None, items, &result).unwrap(), 0);
+        assert_eq!(titles(), ["First", "Second edit"]);
+        assert_eq!(state.reader().source_digests(FEED).unwrap(), changed);
+    }
+
+    #[tokio::test]
+    async fn bodies_are_limited_without_content_length() {
+        use axum::{Router, body::Body, routing::get};
+        // Streamed in chunks, so there is no Content-Length to check first.
+        let app = Router::new().route(
+            "/{n}",
+            get(
+                |axum::extract::Path(n): axum::extract::Path<usize>| async move {
+                    let chunks = (0..n).map(|_| Ok::<_, std::io::Error>(vec![b'x'; 1000]));
+                    Body::from_stream(futures::stream::iter(chunks))
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let get = |n: usize| {
+            let http = http.clone();
+            async move {
+                let resp = http.get(format!("http://{addr}/{n}")).send().await.unwrap();
+                assert_eq!(resp.content_length(), None);
+                read_limited(resp, 5000, "body").await
+            }
+        };
+        assert_eq!(get(5).await.unwrap().len(), 5000);
+        assert_eq!(
+            get(1000).await.unwrap_err(),
+            "body is larger than 5000 bytes"
+        );
     }
 
     #[test]
