@@ -24,16 +24,16 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
   large feed or a long write no longer holds up API requests.
 - Full articles are fetched in the background, at most four feeds at once,
   instead of holding a feed-polling slot until every page has loaded.
-- Feed and article bodies are cut off at their size limit as they download,
-  even without a `Content-Length`.
+- Feed and article bodies are cut off at their size limit as they download, even
+  without a `Content-Length`.
 - Entries unchanged since the last fetch are no longer re-sanitized (a new
-  database column records each one's digest as sent), and per-feed pruning
-  only runs when something was added or `maxAgeDays` is set.
+  database column records each one's digest as sent), and per-feed pruning only
+  runs when something was added or `maxAgeDays` is set.
 
 ### Terminal client
 
-- Pages by cursor, falling back to offsets with an older server; asks for
-  gzip responses.
+- Pages by cursor, falling back to offsets with an older server; asks for gzip
+  responses.
 
 ## [0.1.0] - 2026-11-07
 
