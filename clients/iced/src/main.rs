@@ -6,6 +6,8 @@
 mod api;
 mod app;
 mod config;
+#[cfg(test)]
+mod test_server;
 mod theme;
 mod ui;
 

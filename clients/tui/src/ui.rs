@@ -182,3 +182,179 @@ fn draw_reader(frame: &mut Frame, app: &App, area: Rect) {
         .scroll((reader.scroll, 0));
     frame.render_widget(paragraph, area);
 }
+
+#[cfg(test)]
+mod tests {
+    use pressbox_api::{Feed, Item};
+    use ratatui::{Terminal, backend::TestBackend};
+
+    use super::*;
+    use crate::app::{Reader, Show};
+
+    fn feed(id: &str, unread: u32) -> Feed {
+        Feed {
+            id: id.into(),
+            title: format!("Feed {id}"),
+            url: format!("https://{id}.example/"),
+            site_url: None,
+            tags: Vec::new(),
+            unread,
+            total: unread,
+            last_fetched: None,
+            last_error: None,
+            archived: false,
+        }
+    }
+
+    fn item(id: i64, feed: &str, read: bool, starred: bool) -> Item {
+        Item {
+            id,
+            feed_id: feed.into(),
+            title: format!("Story {id}"),
+            url: Some(format!("https://{feed}.example/{id}")),
+            author: Some("Ana".into()),
+            summary: Some("<p>The summary.</p>".into()),
+            content: None,
+            published: 1_793_700_000,
+            read,
+            starred,
+        }
+    }
+
+    /// An app with two feeds (one failing, one removed) and two items.
+    fn app() -> App {
+        let mut app = App::new();
+        let mut failing = feed("a", 2);
+        failing.last_error = Some("HTTP 500".into());
+        let mut removed = feed("old", 0);
+        removed.archived = true;
+        app.feeds = vec![failing, feed("b", 0), removed];
+        app.items = vec![item(1, "a", false, true), item(2, "b", true, false)];
+        app
+    }
+
+    /// The screen as text, one string per row.
+    fn screen(app: &App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        buffer
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
+    }
+
+    fn contains(rows: &[String], text: &str) -> bool {
+        rows.iter().any(|r| r.contains(text))
+    }
+
+    #[test]
+    fn draws_feeds_items_and_help() {
+        let rows = screen(&app(), 120, 12);
+        for text in [
+            " Feeds ",
+            "All items (2)",
+            "★ Starred",
+            "Feed a (2) !",
+            "Feed old (removed)",
+            " Items: 2 unread ",
+            "● ★ ",
+            "Feed a",
+            "Story 1",
+            "Story 2",
+            "j/k move",
+        ] {
+            assert!(
+                contains(&rows, text),
+                "{text:?} missing:\n{}",
+                rows.join("\n")
+            );
+        }
+        assert!(
+            !contains(&rows, "Feed b ("),
+            "no count when nothing is unread"
+        );
+    }
+
+    #[test]
+    fn titles_follow_the_view() {
+        let mut app = app();
+        app.next_page = Some(crate::app::NextPage::Cursor("c".into()));
+        app.show = Show::Read;
+        assert!(contains(&screen(&app, 120, 8), " Items: 2 read+ "));
+        app.feed_row = STARRED_ROW;
+        assert!(contains(&screen(&app, 120, 8), " Items: 2 all+ "));
+        app.search = Some("rust".into());
+        assert!(contains(
+            &screen(&app, 120, 8),
+            " Search \"rust\": 2+ (esc clears) "
+        ));
+
+        // One feed: no feed column.
+        app.search = None;
+        app.feed_row = FIXED_ROWS;
+        let rows = screen(&app, 120, 8);
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("Feed a") && r.contains("Story 1"))
+        );
+    }
+
+    #[test]
+    fn draws_the_reader() {
+        let mut app = app();
+        app.reader = Some(Reader {
+            item: item(1, "a", false, false),
+            scroll: 0,
+        });
+        app.focus = Pane::Reader;
+        let rows = screen(&app, 100, 24);
+        for text in [
+            " Reader unread ",
+            "Story 1",
+            "Feed a · Ana · ",
+            "https://a.example/1",
+            "The summary.",
+        ] {
+            assert!(
+                contains(&rows, text),
+                "{text:?} missing:\n{}",
+                rows.join("\n")
+            );
+        }
+        app.reader.as_mut().unwrap().item.starred = true;
+        assert!(contains(&screen(&app, 100, 24), " Reader ★ "));
+    }
+
+    #[test]
+    fn status_line_shows_prompts_and_messages() {
+        let mut app = app();
+        app.editing = Some("nix".into());
+        let rows = screen(&app, 100, 6);
+        assert!(
+            rows[5].starts_with("/nix█   enter search  esc cancel"),
+            "{}",
+            rows[5]
+        );
+
+        app.editing = None;
+        app.status = "error: offline".into();
+        let mut terminal = Terminal::new(TestBackend::new(100, 6)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let cell = &terminal.backend().buffer()[(0, 5)];
+        assert_eq!((cell.symbol(), cell.fg), ("e", Color::Red));
+
+        app.status = "reloaded".into();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let cell = &terminal.backend().buffer()[(0, 5)];
+        assert_eq!((cell.symbol(), cell.fg), ("r", Color::Yellow));
+    }
+
+    #[test]
+    fn dates_are_short() {
+        assert_eq!(date(i64::MAX), "");
+        assert_eq!(date(1_793_700_000).len(), 6, "like \"Nov 03\"");
+    }
+}

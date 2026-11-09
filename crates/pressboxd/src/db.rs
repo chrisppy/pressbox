@@ -2053,6 +2053,87 @@ mod tests {
     }
 
     #[test]
+    fn upgrading_from_the_first_schema_cleans_stored_html() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(MIGRATIONS[0]).unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(
+            r#"INSERT INTO feeds (id, url) VALUES ('blog', 'https://blog.example/feed.xml');
+               INSERT INTO items (id, feed_id, guid, title, url, summary, content, published)
+               VALUES (1, 'blog', 'g', 'Post', '/posts/1',
+                       '<p onclick="x()">Hi</p>',
+                       '<p>Unique <script>bad()</script><a href="/about">words</a></p>', 5);"#,
+        )
+        .unwrap();
+        // As `open` does, minus the file.
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let mut db = Db { conn };
+        db.migrate().unwrap();
+        db.conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        db.sync(&config(
+            "[feeds.blog]\nurl = \"https://blog.example/feed.xml\"",
+        ))
+        .unwrap();
+
+        let user = db.only_user().unwrap().unwrap().id;
+        let item = db.item(user, 1).unwrap().unwrap();
+        let content = item.content.unwrap();
+        assert!(
+            !content.contains("script") && !content.contains("bad()"),
+            "{content}"
+        );
+        assert!(
+            content.contains(r#"href="https://blog.example/about""#),
+            "relative to the item's link: {content}"
+        );
+        assert!(!item.summary.unwrap().contains("onclick"));
+        let search = ItemQuery {
+            q: Some("unique".into()),
+            ..q()
+        };
+        assert_eq!(db.items(user, &search).unwrap().items.len(), 1, "indexed");
+    }
+
+    #[test]
+    fn refuses_a_newer_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        let newer = i64::try_from(MIGRATIONS.len()).unwrap() + 1;
+        conn.pragma_update(None, "user_version", newer).unwrap();
+        let error = Db::init(conn).err().unwrap();
+        assert!(format!("{error}").contains("upgrade pressboxd"), "{error}");
+    }
+
+    #[test]
+    fn filters_unstarred_and_names_devices() {
+        let (mut db, chris, _) = two_users();
+        db.upsert_items(A, 0, &[item("a1", Some(1)), item("a2", Some(2))])
+            .unwrap();
+        let a1 = db.items(chris, &q()).unwrap().items[1].id;
+        db.set_starred(chris, a1, true).unwrap();
+        let unstarred = ItemQuery {
+            starred: Some(false),
+            ..q()
+        };
+        assert_eq!(titles(&db.items(chris, &unstarred).unwrap()), ["title a2"]);
+
+        for (n, expected) in ["pc", "pc-2", "pc-3"].iter().enumerate() {
+            let name = db.add_device(chris, "pc", &format!("h{n}"), 0).unwrap();
+            assert_eq!(&name, expected);
+        }
+        assert!(db.remove_device("pc-2").unwrap());
+        assert_eq!(
+            db.add_device(chris, "pc", "h9", 0).unwrap(),
+            "pc-2",
+            "freed"
+        );
+        assert!(
+            db.add_device(chris, "pc", "h9", 0).is_err(),
+            "tokens are unique"
+        );
+        assert_eq!(BadCursor.to_string(), "invalid cursor");
+    }
+
+    #[test]
     fn migrates_a_single_user_database() {
         let path =
             std::env::temp_dir().join(format!("pressboxd-migrate3-{}.db", std::process::id()));

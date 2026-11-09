@@ -16,6 +16,9 @@ use serde::de::DeserializeOwned;
 
 pub type Result<T> = std::result::Result<T, String>;
 
+/// How often `pair_wait` asks whether the code has been approved.
+const PAIR_POLL: Duration = Duration::from_secs(2);
+
 #[derive(Debug, Clone)]
 pub struct Client {
     http: reqwest::Client,
@@ -118,6 +121,10 @@ impl Client {
 
     /// Polls until the pairing is approved, denied or expired.
     pub async fn pair_wait(self, poll_id: String) -> Result<PairApproved> {
+        self.pair_wait_every(poll_id, PAIR_POLL).await
+    }
+
+    async fn pair_wait_every(self, poll_id: String, every: Duration) -> Result<PairApproved> {
         loop {
             let resp = self
                 .request(Method::GET, &format!("/api/v1/pair/{poll_id}"))
@@ -126,7 +133,7 @@ impl Client {
                 .map_err(describe)?;
             match resp.status() {
                 StatusCode::OK => return resp.json().await.map_err(describe),
-                StatusCode::ACCEPTED => tokio::time::sleep(Duration::from_secs(2)).await,
+                StatusCode::ACCEPTED => tokio::time::sleep(every).await,
                 StatusCode::NOT_FOUND => return Err("the request was denied or expired".into()),
                 s => return Err(format!("server returned {s}")),
             }
@@ -135,7 +142,8 @@ impl Client {
 
     /// Approves another device's pairing code, for `user` if given (admins).
     pub async fn approve(self, code: String, user: Option<String>) -> Result<Approved> {
-        let path = format!("/api/v1/pairings/{}/approve", code.trim());
+        let code = code.trim();
+        let path = format!("/api/v1/pairings/{code}/approve");
         let resp = self
             .request(Method::POST, &path)
             .json(&ApproveRequest { user })
@@ -177,6 +185,164 @@ fn describe(e: reqwest::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_server::server;
+
+    /// The request lines a canned server saw, without the HTTP version.
+    fn lines(requests: &std::sync::mpsc::Receiver<String>, n: usize) -> Vec<String> {
+        requests
+            .iter()
+            .take(n)
+            .map(|head| {
+                assert!(head.contains("authorization: bearer tok"), "{head}");
+                head.lines()
+                    .next()
+                    .unwrap()
+                    .trim_end_matches(" http/1.1")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reads_and_writes_with_the_token() {
+        let feeds = r#"[{"id":"a","title":"A","url":"https://a.example/","site_url":null,
+            "tags":[],"unread":1,"total":1,"last_fetched":null,"last_error":null,"archived":false}]"#;
+        let item = r#"{"id":7,"feed_id":"a","title":"Seven","url":null,"author":null,
+            "summary":null,"content":"<p>x</p>","published":0,"read":false,"starred":false}"#;
+        let (base, requests) = server(vec![
+            (200, r#"{"version":"0.1.0","api":1}"#),
+            (200, r#"{"user":"chris","admin":true,"device":null}"#),
+            (200, feeds),
+            (200, r#"{"items":[],"next_cursor":"c"}"#),
+            (200, item),
+            (204, ""),
+            (204, ""),
+            (200, r#"{"updated":4}"#),
+            (202, ""),
+        ]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        assert_eq!(client.server(), base);
+        assert_eq!(client.clone().version().await.unwrap().api, 1);
+        assert_eq!(client.clone().me().await.unwrap().user, "chris");
+        assert_eq!(client.clone().feeds().await.unwrap()[0].unread, 1);
+        let query = ItemQuery {
+            tag: Some("tech".into()),
+            cursor: Some("c".into()),
+            ..ItemQuery::default()
+        };
+        let page = client.clone().items(query).await.unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("c"));
+        let item = client.clone().item(7).await.unwrap();
+        assert_eq!(item.content.as_deref(), Some("<p>x</p>"));
+        client.clone().set_read(7, true).await.unwrap();
+        client.clone().set_starred(7, false).await.unwrap();
+        assert_eq!(client.clone().mark_feed_read("a".into()).await.unwrap(), 4);
+        client.clone().refresh().await.unwrap();
+        assert_eq!(
+            lines(&requests, 9),
+            [
+                "get /api/v1/version",
+                "get /api/v1/me",
+                "get /api/v1/feeds",
+                "get /api/v1/items?tag=tech&cursor=c",
+                "get /api/v1/items/7",
+                "put /api/v1/items/7/read",
+                "put /api/v1/items/7/starred",
+                "post /api/v1/feeds/a/read-all",
+                "post /api/v1/refresh",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn explains_failures() {
+        let (base, _requests) = server(vec![(401, "{}"), (503, "{}"), (200, "not json")]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        assert_eq!(
+            client.clone().feeds().await.unwrap_err(),
+            "the server rejected the token (401)"
+        );
+        assert_eq!(
+            client.clone().refresh().await.unwrap_err(),
+            "server returned 503 Service Unavailable"
+        );
+        assert!(
+            client
+                .clone()
+                .me()
+                .await
+                .unwrap_err()
+                .starts_with("unexpected response")
+        );
+
+        // Nothing listens on the discard port.
+        let nobody = Client::new("http://127.0.0.1:9", None).unwrap();
+        assert_eq!(
+            nobody.feeds().await.unwrap_err(),
+            "could not connect to the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn pairs_and_approves() {
+        let (base, requests) = server(vec![
+            (201, r#"{"code":"K7W-4QX","poll_id":"p1","expires_in":600}"#),
+            (202, r#"{"status":"pending"}"#),
+            (200, r#"{"token":"secret","name":"laptop"}"#),
+            (404, "{}"),
+            (500, "{}"),
+        ]);
+        let client = Client::new(&base, None).unwrap();
+        let start = client.clone().pair_start("laptop".into()).await.unwrap();
+        assert_eq!(start.code, "K7W-4QX");
+        let wait = |c: &Client| c.clone().pair_wait_every("p1".into(), Duration::ZERO);
+        assert_eq!(wait(&client).await.unwrap().token, "secret");
+        assert_eq!(
+            wait(&client).await.unwrap_err(),
+            "the request was denied or expired"
+        );
+        assert!(wait(&client).await.unwrap_err().contains("500"));
+        let paths: Vec<String> = requests
+            .iter()
+            .take(3)
+            .map(|h| h.lines().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "post /api/v1/pair http/1.1",
+                "get /api/v1/pair/p1 http/1.1",
+                "get /api/v1/pair/p1 http/1.1"
+            ]
+        );
+
+        let (base, _requests) = server(vec![
+            (404, "{}"),
+            (403, "{}"),
+            (400, "{}"),
+            (500, "{}"),
+            (200, r#"{"name":"phone","user":"anna"}"#),
+        ]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        let approve = |user: Option<&str>| {
+            client
+                .clone()
+                .approve(" K7W-4QX ".into(), user.map(str::to_owned))
+        };
+        assert_eq!(
+            approve(None).await.unwrap_err(),
+            "no pending request with code K7W-4QX"
+        );
+        assert!(
+            approve(Some("anna"))
+                .await
+                .unwrap_err()
+                .contains("only admins")
+        );
+        assert_eq!(approve(Some("nobody")).await.unwrap_err(), "no such user");
+        assert!(approve(None).await.unwrap_err().contains("500"));
+        assert_eq!(approve(Some("anna")).await.unwrap().user, "anna");
+    }
 
     #[test]
     fn normalizes_server() {

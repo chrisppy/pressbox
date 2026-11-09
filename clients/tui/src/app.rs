@@ -770,6 +770,45 @@ mod tests {
     }
 
     #[test]
+    fn works_against_a_real_client() {
+        let feeds = r#"[{"id":"a","title":"A","url":"https://a.example/","site_url":null,
+            "tags":[],"unread":1,"total":1,"last_fetched":null,"last_error":null,"archived":false}]"#;
+        let page = r#"{"items":[{"id":7,"feed_id":"a","title":"Seven","url":null,"author":null,
+            "summary":null,"published":0,"read":false,"starred":false}],"next_cursor":null}"#;
+        let (base, requests) =
+            crate::test_server::server(vec![(200, feeds), (200, page), (202, ""), (401, "{}")]);
+        let client = Client::new(&base, Some("t".into())).unwrap();
+        let mut app = App::new();
+        app.reload(&client);
+        assert_eq!(
+            (app.total_unread(), app.items[0].title.as_str()),
+            (1, "Seven")
+        );
+        let _ = app.handle(KeyCode::Char('R'), &client);
+        assert!(
+            app.status.starts_with("server is refreshing"),
+            "{}",
+            app.status
+        );
+        app.reload(&client);
+        assert_eq!(app.status, "error: the server rejected the token (401)");
+        let paths: Vec<String> = requests
+            .iter()
+            .take(4)
+            .map(|h| h.split(' ').nth(1).unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            [
+                "/api/v1/feeds",
+                "/api/v1/items?unread=true&limit=100",
+                "/api/v1/refresh",
+                "/api/v1/feeds"
+            ]
+        );
+    }
+
+    #[test]
     fn search_prompt() {
         let fake = Fake::new();
         let mut app = App::new();

@@ -17,6 +17,8 @@ const PAGE: u32 = 50;
 
 pub struct App {
     pub config: ClientConfig,
+    /// Where `config` lives (`client.json`), if there is a config directory.
+    pub config_path: Option<std::path::PathBuf>,
     pub screen: Screen,
     pub dark: bool,
 }
@@ -113,10 +115,12 @@ pub enum Message {
 
 impl App {
     pub fn boot() -> (Self, Task<Message>) {
-        let (config, session) = config::load_session();
+        let config_path = ClientConfig::default_path();
+        let (config, session) = config::load_session(config_path.as_deref());
         let mut app = Self {
             screen: Screen::Setup(Setup::default()),
             config,
+            config_path,
             dark: true,
         };
         let theme = iced::system::theme().map(Message::ThemeMode);
@@ -246,7 +250,9 @@ impl App {
                         server: api::normalize_server(&setup.server),
                         token: approved.token,
                     };
-                    if let Err(e) = config::save_session(&self.config, &session) {
+                    if let Err(e) =
+                        config::save_session(&self.config, self.config_path.as_deref(), &session)
+                    {
                         setup.busy = false;
                         setup.error = Some(format!("Paired, but could not save the token: {e:#}"));
                         return Task::none();
@@ -279,7 +285,7 @@ impl App {
 
 impl Reader {
     /// An empty reader showing unread items; nothing is loaded yet.
-    fn new(client: Client) -> Self {
+    pub(crate) fn new(client: Client) -> Self {
         Self {
             client,
             me: None,
@@ -669,6 +675,8 @@ fn default_device_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    use pressbox_api::{Me, Version};
+
     use super::*;
 
     #[test]
@@ -856,6 +864,173 @@ mod tests {
         assert_eq!(r.status.as_deref(), Some("Approved phone for chris"));
         let _ = r.update(Message::MarkedAllRead(Ok(1)));
         assert_eq!(r.status.as_deref(), Some("Marked 1 item as read"));
+    }
+
+    /// An app on the pairing screen whose files live in a temporary
+    /// directory, so nothing touches the real config.
+    fn setup_app(name: &str) -> (App, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pressbox-iced-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App {
+            config: ClientConfig {
+                server: None,
+                token_file: Some(dir.join("token")),
+            },
+            config_path: Some(dir.join("client.json")),
+            screen: Screen::Setup(Setup::default()),
+            dark: true,
+        };
+        app.screen = Screen::Setup(app.new_setup());
+        (app, dir)
+    }
+
+    fn setup(app: &App) -> &Setup {
+        match &app.screen {
+            Screen::Setup(s) => s,
+            Screen::Reader(_) => panic!("expected the setup screen"),
+        }
+    }
+
+    #[test]
+    fn pairing_saves_the_session_and_opens_the_reader() {
+        let (mut app, dir) = setup_app("pair");
+        assert!(!setup(&app).device.is_empty(), "defaults to the host name");
+        let _ = app.update(Message::DeviceChanged(String::new()));
+        let _ = app.update(Message::Pair);
+        assert_eq!(
+            setup(&app).error.as_deref(),
+            Some("Enter the server address and a device name.")
+        );
+
+        let _ = app.update(Message::ServerChanged("rss.example/".into()));
+        let _ = app.update(Message::DeviceChanged("laptop".into()));
+        let _ = app.update(Message::Pair);
+        assert!(setup(&app).busy && setup(&app).error.is_none());
+        let _ = app.update(Message::PairStarted(Ok(PairStart {
+            code: "K7W-4QX".into(),
+            poll_id: "p".into(),
+            expires_in: 600,
+        })));
+        assert_eq!(setup(&app).code.as_deref(), Some("K7W-4QX"));
+        assert_eq!(app.title(), "pressbox");
+
+        let _ = app.update(Message::PairDone(Ok(PairApproved {
+            token: "secret".into(),
+            name: "laptop".into(),
+        })));
+        let Screen::Reader(reader) = &app.screen else {
+            panic!("expected the reader");
+        };
+        assert_eq!(reader.client.server(), "https://rss.example");
+        assert!(reader.loading, "the first page is on its way");
+        assert_eq!(app.config.server.as_deref(), Some("https://rss.example"));
+        assert_eq!(app.config.token().as_deref(), Some("secret"));
+        let saved = ClientConfig::load(&dir.join("client.json")).unwrap();
+        assert_eq!(saved.server.as_deref(), Some("https://rss.example"));
+
+        if let Screen::Reader(reader) = &mut app.screen {
+            reader.feeds = vec![feed("a", 4, &[])];
+        }
+        assert_eq!(app.title(), "pressbox (4)");
+
+        // Signing out forgets the token and goes back to pairing, with the
+        // server filled in.
+        let _ = app.update(Message::SignOut);
+        assert_eq!(setup(&app).server, "https://rss.example");
+        assert!(app.config.token().is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pairing_failures_are_shown() {
+        let (mut app, dir) = setup_app("fail");
+        let _ = app.update(Message::ServerChanged("https://rss.example".into()));
+        let _ = app.update(Message::Pair);
+        let _ = app.update(Message::PairStarted(Err("could not connect".into())));
+        let s = setup(&app);
+        assert!(!s.busy && s.code.is_none());
+        assert_eq!(s.error.as_deref(), Some("could not connect"));
+
+        let _ = app.update(Message::PairDone(Err("denied".into())));
+        assert_eq!(setup(&app).error.as_deref(), Some("denied"));
+
+        // The token can't be written: paired, but say so and stay here.
+        app.config.token_file = Some(std::path::PathBuf::from("/proc/nope/token"));
+        let _ = app.update(Message::PairDone(Ok(PairApproved {
+            token: "secret".into(),
+            name: "laptop".into(),
+        })));
+        let error = setup(&app).error.clone().unwrap();
+        assert!(
+            error.starts_with("Paired, but could not save the token"),
+            "{error}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn theme_follows_the_system() {
+        let (mut app, _) = setup_app("theme");
+        let _ = app.update(Message::ThemeMode(iced::theme::Mode::Light));
+        assert!(!app.dark);
+        let light = app.theme();
+        let _ = app.update(Message::ThemeMode(iced::theme::Mode::Dark));
+        assert!(app.dark);
+        assert_ne!(app.theme().palette(), light.palette());
+    }
+
+    #[test]
+    fn errors_and_refreshes() {
+        let mut r = reader();
+        for message in [
+            Message::FeedsLoaded(Err("a".into())),
+            Message::ItemLoaded(Err("b".into())),
+            Message::Refreshed(Err("c".into())),
+            Message::Approved(Err("d".into())),
+            Message::MarkedAllRead(Err("e".into())),
+            Message::Identity(Err("f".into())),
+        ] {
+            let _ = r.update(message);
+        }
+        assert_eq!(r.error.as_deref(), Some("f"));
+        let _ = r.update(Message::Refresh);
+        assert_eq!(r.status.as_deref(), Some("Refreshing feeds…"));
+        let _ = r.update(Message::Refreshed(Ok(())));
+        assert!(r.status.is_none() && r.loading);
+        let _ = r.update(Message::FeedsLoaded(Ok(vec![feed("a", 1, &[])])));
+        assert_eq!(r.feeds.len(), 1);
+        let _ = r.update(Message::Identity(Ok((
+            Me {
+                user: "chris".into(),
+                admin: true,
+                device: None,
+            },
+            Version {
+                version: "0.1.0".into(),
+                api: 1,
+            },
+        ))));
+        assert_eq!(r.me.as_ref().unwrap().user, "chris");
+
+        // Mark all read covers the feeds the source shows with unread items.
+        r.feeds = vec![
+            feed("a", 1, &["t"]),
+            feed("b", 0, &["t"]),
+            feed("c", 2, &[]),
+        ];
+        for source in [Source::Starred, Source::Tag("none".into())] {
+            r.source = source;
+            let _ = r.update(Message::MarkAllRead);
+        }
+        let _ = r.update(Message::Approve);
+        let _ = r.update(Message::SearchChanged("rust".into()));
+        let _ = r.update(Message::SearchSubmit);
+        assert_eq!(r.query().q.as_deref(), Some("rust"));
+        let _ = r.update(Message::MarkedAllRead(Ok(3)));
+        assert_eq!(r.status.as_deref(), Some("Marked 3 items as read"));
+        let _ = r.update(Message::Toggle(Flag::Read));
+        let _ = r.update(Message::OpenInBrowser);
+        assert!(r.article.is_none(), "nothing open, nothing toggled");
     }
 
     #[test]

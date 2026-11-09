@@ -418,3 +418,288 @@ fn star(theme: &Theme) -> text::Style {
         color: Some(Colors::of(theme).star),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use iced_test::simulator;
+    use pressbox_api::{Feed, Me, Version};
+
+    use super::*;
+    use crate::api::Client;
+
+    fn feed(id: &str, unread: u32, tags: &[&str]) -> Feed {
+        Feed {
+            id: id.into(),
+            title: format!("Feed {id}"),
+            url: format!("https://{id}.example/"),
+            site_url: None,
+            tags: tags.iter().map(|&t| t.into()).collect(),
+            unread,
+            total: unread,
+            last_fetched: None,
+            last_error: None,
+            archived: false,
+        }
+    }
+
+    fn item(id: i64, read: bool, starred: bool) -> Item {
+        Item {
+            id,
+            feed_id: "a".into(),
+            title: format!("Story {id}"),
+            url: Some(format!("https://a.example/{id}")),
+            author: Some("Ana".into()),
+            summary: None,
+            content: None,
+            published: 1_793_700_000,
+            read,
+            starred,
+        }
+    }
+
+    /// A reader with feeds (one failing, one archived) and two items.
+    fn reader() -> Reader {
+        let mut reader = Reader::new(Client::new("https://rss.example", Some("t".into())).unwrap());
+        let mut failing = feed("b", 0, &[]);
+        failing.last_error = Some("HTTP 500".into());
+        let mut old = feed("old", 0, &[]);
+        old.archived = true;
+        reader.feeds = vec![feed("a", 3, &["tech"]), failing, old];
+        reader.items = vec![item(1, false, true), item(2, true, false)];
+        reader
+    }
+
+    #[test]
+    fn setup_asks_for_a_server_and_shows_the_code() {
+        let mut setup = Setup {
+            server: "https://rss.example".into(),
+            device: "laptop".into(),
+            ..Setup::default()
+        };
+        let mut ui = simulator(setup_view(&setup));
+        assert!(
+            ui.find("Pair this computer with your pressbox server.")
+                .is_ok()
+        );
+        assert!(ui.find("Approve this code:").is_err());
+        ui.click("Pair this device").unwrap();
+        assert!(matches!(
+            ui.into_messages().collect::<Vec<_>>()[..],
+            [Message::Pair]
+        ));
+
+        setup.busy = true;
+        setup.code = Some("K7W-4QX".into());
+        setup.error = Some("could not connect".into());
+        let mut ui = simulator(setup_view(&setup));
+        for shown in [
+            "Approve this code:",
+            "K7W-4QX",
+            "Waiting for approval…",
+            "could not connect",
+        ] {
+            assert!(ui.find(shown).is_ok(), "{shown}");
+        }
+        let _ = ui.click("Pair this device");
+        assert_eq!(ui.into_messages().count(), 0, "disabled while pairing");
+    }
+
+    #[test]
+    fn sidebar_lists_sources_and_who_we_are() {
+        let mut reader = reader();
+        reader.me = Some(Me {
+            user: "chris".into(),
+            admin: true,
+            device: Some("laptop".into()),
+        });
+        reader.version = Some(Version {
+            version: "0.1.0".into(),
+            api: 1,
+        });
+        let mut ui = simulator(sidebar(&reader));
+        for shown in [
+            "Unread",
+            "Tags",
+            "#tech",
+            "Feeds",
+            "Feed a",
+            "Feed b ⚠",
+            "Archived",
+            "Feed old",
+        ] {
+            assert!(ui.find(shown).is_ok(), "{shown}");
+        }
+        assert!(
+            ui.find("https://rss.example\nchris on laptop\npressboxd 0.1.0")
+                .is_ok()
+        );
+        ui.click("Starred").unwrap();
+        ui.click("#tech").unwrap();
+        ui.click("Refresh").unwrap();
+        ui.click("Sign out").unwrap();
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(matches!(
+            &messages[..],
+            [
+                Message::Select(Source::Starred),
+                Message::Select(Source::Tag(tag)),
+                Message::Refresh,
+                Message::SignOut
+            ] if tag == "tech"
+        ));
+
+        reader.me.as_mut().unwrap().device = None;
+        assert_eq!(
+            identity(&reader),
+            "https://rss.example\nchris\npressboxd 0.1.0"
+        );
+    }
+
+    #[test]
+    fn item_list_opens_items_and_pages() {
+        let mut reader = reader();
+        reader.next_cursor = Some("c".into());
+        let mut ui = simulator(item_list(&reader));
+        assert!(ui.find("Unread").is_ok(), "the source is the heading");
+        ui.click("Story 2").unwrap();
+        ui.click("Load more").unwrap();
+        ui.click("Mark all read").unwrap();
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(matches!(
+            messages[..],
+            [
+                Message::OpenItem(2),
+                Message::LoadMore,
+                Message::MarkAllRead
+            ]
+        ));
+
+        reader.items.clear();
+        reader.source = Source::Starred;
+        let mut ui = simulator(item_list(&reader));
+        assert!(ui.find("Nothing here.").is_ok());
+        let _ = ui.click("Mark all read");
+        assert_eq!(
+            ui.into_messages().count(),
+            0,
+            "starred lists can't be marked read"
+        );
+        reader.loading = true;
+        let mut ui = simulator(item_list(&reader));
+        assert!(ui.find("Loading…").is_ok() && ui.find("Nothing here.").is_err());
+    }
+
+    #[test]
+    fn article_shows_the_item_and_its_actions() {
+        let mut reader = reader();
+        assert!(
+            simulator(article(&reader))
+                .find("Select an item to read it.")
+                .is_ok()
+        );
+
+        reader.article = Some(item(1, false, true));
+        reader.article_text = "The whole story.".into();
+        let mut ui = simulator(article(&reader));
+        assert!(ui.find("Story 1").is_ok() && ui.find("The whole story.").is_ok());
+        ui.click("★ Starred").unwrap();
+        ui.click("Mark read").unwrap();
+        ui.click("Open in browser").unwrap();
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(matches!(
+            messages[..],
+            [
+                Message::Toggle(Flag::Starred),
+                Message::Toggle(Flag::Read),
+                Message::OpenInBrowser
+            ]
+        ));
+
+        let mut read = item(1, true, false);
+        read.url = None;
+        reader.article = Some(read);
+        let mut ui = simulator(article(&reader));
+        assert!(ui.find("☆ Star").is_ok() && ui.find("Mark unread").is_ok());
+        let _ = ui.click("Open in browser");
+        assert_eq!(ui.into_messages().count(), 0, "no link, nothing to open");
+    }
+
+    #[test]
+    fn errors_and_status_show_in_a_banner() {
+        let mut reader = reader();
+        assert!(banner(&reader).is_none());
+        reader.status = Some("Refreshing feeds…".into());
+        assert!(
+            simulator(banner(&reader).unwrap())
+                .find("Refreshing feeds…")
+                .is_ok()
+        );
+        reader.error = Some("offline".into());
+        let mut ui = simulator(banner(&reader).unwrap());
+        assert!(ui.find("offline").is_ok() && ui.find("Refreshing feeds…").is_err());
+        ui.click("Dismiss").unwrap();
+        assert!(matches!(
+            ui.into_messages().collect::<Vec<_>>()[..],
+            [Message::Dismiss]
+        ));
+    }
+
+    #[test]
+    fn whole_screens_render_in_both_themes() {
+        let mut reader = reader();
+        reader.selected = Some(1);
+        reader.article = Some(item(1, false, true));
+        reader.error = Some("offline".into());
+        let reading = App {
+            config: crate::config::ClientConfig::default(),
+            config_path: None,
+            screen: Screen::Reader(Box::new(reader)),
+            dark: true,
+        };
+        let pairing = App {
+            config: crate::config::ClientConfig::default(),
+            config_path: None,
+            screen: Screen::Setup(Setup::default()),
+            dark: false,
+        };
+        for app in [&reading, &pairing] {
+            for dark in [true, false] {
+                let theme = if dark {
+                    crate::theme::DARK.theme(true)
+                } else {
+                    crate::theme::LIGHT.theme(false)
+                };
+                // Drawing runs every style function, in both palettes.
+                simulator(view(app)).snapshot(&theme).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn rows_show_selection_and_hover() {
+        let theme = crate::theme::DARK.theme(true);
+        let palette = theme.extended_palette();
+        let background = |selected, status| row_style(&theme, status, selected).background;
+        assert_eq!(
+            background(true, button::Status::Active),
+            Some(palette.background.strong.color.into())
+        );
+        assert_eq!(
+            background(false, button::Status::Hovered),
+            Some(palette.background.weak.color.into())
+        );
+        assert_eq!(background(false, button::Status::Active), None);
+        let colors = Colors::of(&theme);
+        assert_eq!(muted(&theme).color, Some(colors.muted));
+        assert_eq!(error_text(&theme).color, Some(colors.error));
+        assert_eq!(star(&theme).color, Some(colors.star));
+    }
+
+    #[test]
+    fn dates_show_the_time_today() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(date(now).len(), 5, "like 14:05");
+        assert!(date(1_793_700_000).ends_with(", 2026"));
+        assert_eq!(date(i64::MAX), "");
+    }
+}

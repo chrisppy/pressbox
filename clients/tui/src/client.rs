@@ -179,7 +179,8 @@ impl Client {
 
     /// Approves a pairing code, for `user` if given (admins only).
     pub fn approve(&self, code: &str, user: Option<String>) -> Result<Approved> {
-        let path = format!("/api/v1/pairings/{}/approve", code.trim());
+        let code = code.trim();
+        let path = format!("/api/v1/pairings/{code}/approve");
         let resp = self
             .request(reqwest::Method::POST, &path)
             .json(&ApproveRequest { user })
@@ -205,52 +206,8 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::{BufRead, BufReader, Read, Write},
-        net::TcpListener,
-        sync::mpsc,
-    };
-
     use super::*;
-
-    /// Serves one canned `(status, json)` response per connection, in order,
-    /// and reports each request's line and headers, lowercased.
-    fn server(responses: Vec<(u16, &'static str)>) -> (String, mpsc::Receiver<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            for (status, body) in responses {
-                let (stream, _) = listener.accept().unwrap();
-                let mut reader = BufReader::new(stream);
-                let mut head = String::new();
-                let mut length = 0;
-                loop {
-                    let mut line = String::new();
-                    reader.read_line(&mut line).unwrap();
-                    let line = line.trim_end().to_lowercase();
-                    if line.is_empty() {
-                        break;
-                    }
-                    if let Some(n) = line.strip_prefix("content-length: ") {
-                        length = n.parse().unwrap();
-                    }
-                    head.push_str(&line);
-                    head.push('\n');
-                }
-                reader.read_exact(&mut vec![0; length]).unwrap();
-                tx.send(head).unwrap();
-                write!(
-                    reader.get_mut(),
-                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
-                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                )
-                .unwrap();
-            }
-        });
-        (base, rx)
-    }
+    use crate::test_server::server;
 
     const PAGE: &str = r#"{"items":[],"next_cursor":null}"#;
 
@@ -301,7 +258,8 @@ mod tests {
         assert_eq!(client.pair_poll("p").unwrap(), None, "still waiting");
         assert!(format!("{:#}", client.pair_poll("p").unwrap_err()).contains("denied or expired"));
         assert!(
-            format!("{:#}", client.approve(" K7W-4QX ", None).unwrap_err()).contains("K7W-4QX")
+            format!("{:#}", client.approve(" K7W-4QX ", None).unwrap_err())
+                .ends_with("with code K7W-4QX")
         );
         assert!(
             format!(

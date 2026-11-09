@@ -321,6 +321,60 @@ mod tests {
     }
 
     #[test]
+    fn loads_files_and_tokens() {
+        let dir = std::env::temp_dir().join(format!("pressboxd-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pressbox.toml");
+        let token = dir.join("token");
+        std::fs::write(&token, "  s3cret \n").unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "database = \"/var/lib/pressbox/db.sqlite\"\ntoken_file = {:?}\n",
+                token.display().to_string()
+            ),
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.token().unwrap().as_deref(), Some("s3cret"));
+        assert_eq!(
+            config.backup_dir(),
+            PathBuf::from("/var/lib/pressbox/backups")
+        );
+
+        std::fs::write(&token, "\n").unwrap();
+        let error = config.token().unwrap_err();
+        assert!(format!("{error}").ends_with("is empty"), "{error}");
+        std::fs::remove_file(&token).unwrap();
+        let error = config.token().unwrap_err();
+        assert!(
+            format!("{error}").starts_with("reading token file"),
+            "{error}"
+        );
+
+        std::fs::write(&path, "refresh_interval = \"soon\"").unwrap();
+        let error = Config::load(&path).unwrap_err();
+        assert!(format!("{error}").starts_with("parsing "), "{error}");
+        let error = Config::load(&dir.join("missing.toml")).unwrap_err();
+        assert!(format!("{error}").starts_with("reading "), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
+
+        let explicit =
+            Config::parse("control_socket = \"/run/x.sock\"\nbackup_dir = \"/srv/backups\"")
+                .unwrap();
+        assert_eq!(explicit.control_socket(), PathBuf::from("/run/x.sock"));
+        assert_eq!(explicit.backup_dir(), PathBuf::from("/srv/backups"));
+        assert_eq!(
+            Config::parse("").unwrap().backup_dir(),
+            PathBuf::from("./backups")
+        );
+        assert!(
+            Config::parse("max_age_days = 0").is_err(),
+            "zero days would delete everything"
+        );
+    }
+
+    #[test]
     fn rejects_bad_users() {
         let shared_clash =
             "[feeds.a]\nurl = \"https://a/\"\n[users.x.feeds.a]\nurl = \"https://b/\"";

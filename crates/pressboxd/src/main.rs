@@ -303,10 +303,118 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use axum::{body::Body, http::Request};
+    use chrono::TimeZone;
     use pressbox_api::ItemQuery;
     use tower::ServiceExt;
 
     use super::*;
+
+    #[test]
+    fn status_line_sums_up() {
+        let counts = db::Counts {
+            feeds: 12,
+            users: 2,
+            ..db::Counts::default()
+        };
+        assert_eq!(status_line(&counts, None), "12 feeds, 2 users");
+        let stats = fetch::RefreshStats {
+            fetched: 12,
+            failed: 1,
+            new_items: 5,
+        };
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 11, 9, 14, 5, 0)
+            .unwrap();
+        let failing = db::Counts {
+            failing_feeds: 1,
+            ..counts
+        };
+        assert_eq!(
+            status_line(&failing, Some((stats, at))),
+            "12 feeds, 2 users, 5 new at 14:05, 1 failing"
+        );
+    }
+
+    /// The scheduler fetches what is due, then sleeps until a refresh is
+    /// asked for (or the next feed is due). It reports to systemd, so it
+    /// holds the environment lock, outside the runtime.
+    #[test]
+    fn schedules_fetches_and_wakes_on_refresh() {
+        let _env = systemd::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(scheduler_round_trip());
+    }
+
+    async fn scheduler_round_trip() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Each fetch of the feed adds an item.
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let app = {
+            let fetches = fetches.clone();
+            axum::Router::new().route(
+                "/feed",
+                axum::routing::get(move || {
+                    let n = fetches.fetch_add(1, Ordering::SeqCst) + 1;
+                    let items: String = (1..=n)
+                        .map(|i| format!("<item><title>Item {i}</title><guid>{i}</guid></item>"))
+                        .collect();
+                    async move {
+                        format!(
+                            r#"<rss version="2.0"><channel><title>T</title>{items}</channel></rss>"#
+                        )
+                    }
+                }),
+            )
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let mut db = Db::open_in_memory().unwrap();
+        db.sync(&Config::parse(&format!("[feeds.a]\nurl = \"http://{addr}/feed\"")).unwrap())
+            .unwrap();
+        let user = db.only_user().unwrap().unwrap().id;
+        let mut state = AppState::new(db, None, 100).unwrap();
+        state.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let state = Arc::new(state);
+        let scheduler = tokio::spawn(schedule(state.clone(), 1800));
+
+        let items = || {
+            state
+                .reader()
+                .items(user, &ItemQuery::default())
+                .unwrap()
+                .items
+                .len()
+        };
+        let wait_for = |n: usize| async move {
+            for _ in 0..200 {
+                if items() >= n {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("never got {n} items");
+        };
+        wait_for(1).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "not due again for 30 minutes"
+        );
+
+        state.request_refresh().await;
+        wait_for(2).await;
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        scheduler.abort();
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn reads_do_not_wait_for_the_writer() {

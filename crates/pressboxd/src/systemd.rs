@@ -26,6 +26,11 @@ use tracing::{debug, warn};
 
 use crate::AppState;
 
+/// Held by tests that set systemd's environment variables, or that run code
+/// which reads them, so they don't see each other's.
+#[cfg(test)]
+pub static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The credential name the NixOS module passes the token as.
 pub const TOKEN_CREDENTIAL: &str = "token";
 
@@ -151,8 +156,11 @@ mod tests {
 
     // These read process-wide environment variables, so they run in one test.
     #[test]
-    fn inactive_without_systemd() {
-        // SAFETY: no other test in this crate touches these variables.
+    fn follows_the_systemd_environment() {
+        let _env = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: tests that read these hold ENV_LOCK too.
         unsafe {
             for var in [
                 "LISTEN_PID",
@@ -184,6 +192,88 @@ mod tests {
         unsafe {
             std::env::remove_var("CREDENTIALS_DIRECTORY");
             std::env::remove_var("JOURNAL_STREAM");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+
+        under_systemd();
+    }
+
+    /// The other half of the test above, kept apart for reading. Speaks
+    /// systemd's side of the protocol through the same variables.
+    fn under_systemd() {
+        use std::os::unix::net::UnixDatagram;
+
+        let dir = std::env::temp_dir().join(format!("pressboxd-notify-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = UnixDatagram::bind(dir.join("notify")).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let stderr = std::fs::File::from(io::stderr().as_fd().try_clone_to_owned().unwrap())
+            .metadata()
+            .unwrap();
+        // SAFETY: as above.
+        unsafe {
+            std::env::set_var("NOTIFY_SOCKET", dir.join("notify"));
+            std::env::set_var(
+                "JOURNAL_STREAM",
+                format!("{}:{}", stderr.dev(), stderr.ino()),
+            );
+            std::env::set_var("RUNTIME_DIRECTORY", &dir);
+            std::env::set_var("WATCHDOG_USEC", "100000");
+            std::env::set_var("WATCHDOG_PID", std::process::id().to_string());
+        }
+        let receive = |socket: &UnixDatagram| {
+            let mut buf = [0; 256];
+            let n = socket.recv(&mut buf).unwrap();
+            String::from_utf8_lossy(&buf[..n]).into_owned()
+        };
+        let next = || receive(&socket);
+
+        assert!(stderr_is_journal(), "stderr is the stream systemd named");
+        assert_eq!(
+            crate::config::Config::parse("").unwrap().control_socket(),
+            dir.join("control.sock"),
+            "the socket goes in RuntimeDirectory="
+        );
+        ready("listening on 127.0.0.1:8470");
+        assert_eq!(next(), "READY=1\nSTATUS=listening on 127.0.0.1:8470\n");
+        status("3 feeds");
+        assert_eq!(next(), "STATUS=3 feeds\n");
+        stopping();
+        assert_eq!(next(), "STOPPING=1\nSTATUS=shutting down\n");
+
+        // The watchdog pings at half of WatchdogSec= while the database
+        // answers.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let state = Arc::new(AppState::new(Db::open_in_memory().unwrap(), None, 10).unwrap());
+            spawn_watchdog(state);
+            let listener = socket.try_clone().unwrap();
+            let ping = tokio::task::spawn_blocking(move || receive(&listener));
+            assert_eq!(ping.await.unwrap(), "WATCHDOG=1\n");
+        });
+        drop(runtime);
+
+        // A socket nobody listens on is logged, not fatal.
+        drop(socket);
+        status("nobody hears this");
+
+        // SAFETY: as above.
+        unsafe {
+            for var in [
+                "NOTIFY_SOCKET",
+                "JOURNAL_STREAM",
+                "RUNTIME_DIRECTORY",
+                "WATCHDOG_USEC",
+                "WATCHDOG_PID",
+            ] {
+                std::env::remove_var(var);
+            }
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

@@ -98,42 +98,46 @@ enum Command {
 }
 
 fn main() {
-    if let Err(e) = run(Args::parse()) {
+    if let Err(e) = run(Args::parse(), &mut std::io::stdout().lock()) {
         eprintln!("pressboxctl: {e:#}");
         std::process::exit(1);
     }
 }
 
-fn run(args: Args) -> Result<()> {
+/// Runs a command, printing its output to `out` (notes go to stderr).
+fn run(args: Args, out: &mut impl Write) -> Result<()> {
     let ctl = Control {
         socket: args.socket,
     };
     match args.command {
         Command::Status => {
             let s: Status = ctl.json("GET", "/admin/status", None::<()>)?;
-            println!(
+            writeln!(
+                out,
                 "feeds:            {} ({} failing)",
                 s.feeds, s.failing_feeds
-            );
+            )?;
             if s.archived_feeds > 0 {
-                println!(
+                writeln!(
+                    out,
                     "archived feeds:   {} (removed, kept for starred items)",
                     s.archived_feeds
-                );
+                )?;
             }
-            println!("items:            {}", s.items);
-            println!("users:            {}", s.users);
-            println!("devices:          {}", s.devices);
-            println!("pending pairings: {}", s.pending_pairings);
+            writeln!(out, "items:            {}", s.items)?;
+            writeln!(out, "users:            {}", s.users)?;
+            writeln!(out, "devices:          {}", s.devices)?;
+            writeln!(out, "pending pairings: {}", s.pending_pairings)?;
         }
         Command::Users => {
             let users: Vec<UserInfo> = ctl.json("GET", "/admin/users", None::<()>)?;
             for u in users {
                 let admin = if u.admin { "admin" } else { "" };
-                println!(
+                writeln!(
+                    out,
                     "{:<20} {:<6} {:>3} feeds  {:>2} devices",
                     u.name, admin, u.feeds, u.devices
-                );
+                )?;
             }
         }
         Command::Devices { user } => {
@@ -143,16 +147,17 @@ fn run(args: Args) -> Result<()> {
                 .filter(|d| user.as_ref().is_none_or(|u| &d.user == u))
                 .collect();
             if devices.is_empty() {
-                println!("no devices paired");
+                writeln!(out, "no devices paired")?;
             }
             for d in devices {
                 let seen = d.last_seen.map_or_else(|| "never".to_owned(), ago);
-                println!(
+                writeln!(
+                    out,
                     "{:<24} {:<16} paired {:<10} last seen {seen}",
                     d.name,
                     d.user,
                     ago(d.created)
-                );
+                )?;
             }
         }
         Command::Revoke { name } => {
@@ -162,7 +167,7 @@ fn run(args: Args) -> Result<()> {
                 None::<()>,
             )
             .with_context(|| format!("revoking {name:?}"))?;
-            println!("revoked {name}");
+            writeln!(out, "revoked {name}")?;
         }
         Command::AddDevice { name, user } => {
             let d: NewDevice = ctl.json(
@@ -174,15 +179,21 @@ fn run(args: Args) -> Result<()> {
                 "created device {} for {}; its token (shown only now):",
                 d.name, d.user
             );
-            println!("{}", d.token);
+            writeln!(out, "{}", d.token)?;
         }
         Command::Pairings => {
             let pending: Vec<PendingPairing> = ctl.json("GET", "/admin/pairings", None::<()>)?;
             if pending.is_empty() {
-                println!("no pairing requests");
+                writeln!(out, "no pairing requests")?;
             }
             for p in pending {
-                println!("{}  {:<24} requested {}", p.code, p.name, ago(p.requested));
+                writeln!(
+                    out,
+                    "{}  {:<24} requested {}",
+                    p.code,
+                    p.name,
+                    ago(p.requested)
+                )?;
             }
         }
         Command::Approve { code, user } => {
@@ -190,7 +201,7 @@ fn run(args: Args) -> Result<()> {
             let a: Approved = ctl
                 .json("POST", &path, Some(ApproveRequest { user }))
                 .with_context(|| format!("approving {code}"))?;
-            println!("paired {} for {}", a.name, a.user);
+            writeln!(out, "paired {} for {}", a.name, a.user)?;
         }
         Command::Deny { code } => {
             ctl.call(
@@ -199,31 +210,31 @@ fn run(args: Args) -> Result<()> {
                 None::<()>,
             )
             .with_context(|| format!("denying {code}"))?;
-            println!("denied {code}");
+            writeln!(out, "denied {code}")?;
         }
         Command::Backup { keep } => {
             let r: BackupResult =
                 ctl.json("POST", "/admin/backup", Some(BackupRequest { keep }))?;
-            println!("{}", r.path);
+            writeln!(out, "{}", r.path)?;
             for old in r.removed {
                 eprintln!("removed {old}");
             }
         }
         Command::Refresh => {
             ctl.call("POST", "/admin/refresh", None::<()>)?;
-            println!("refreshing all feeds");
+            writeln!(out, "refreshing all feeds")?;
         }
         Command::OpmlExport { user } => {
             let path = match user {
                 Some(u) => format!("/admin/opml?user={}", encode(&u)),
                 None => "/admin/opml".to_owned(),
             };
-            print!("{}", ctl.call("GET", &path, None::<()>)?);
+            write!(out, "{}", ctl.call("GET", &path, None::<()>)?)?;
         }
         Command::OpmlToNix { file } => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading {}", file.display()))?;
-            print!("{}", opml_to_nix(&text)?);
+            write!(out, "{}", opml_to_nix(&text)?)?;
         }
         Command::Discover { url } => {
             let feeds = tokio::runtime::Builder::new_current_thread()
@@ -233,7 +244,7 @@ fn run(args: Args) -> Result<()> {
             if feeds.is_empty() {
                 bail!("no feeds found at {url}");
             }
-            print!("{}", discovered_to_nix(&feeds));
+            write!(out, "{}", discovered_to_nix(&feeds))?;
         }
     }
     Ok(())
@@ -646,7 +657,354 @@ fn discovered_to_nix(feeds: &[Discovered]) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader},
+        os::unix::net::UnixListener,
+        sync::mpsc,
+    };
+
     use super::*;
+
+    /// A stand-in control socket: answers each connection with the next
+    /// canned `(status, body)` and reports the request line and body.
+    struct FakeSocket {
+        dir: PathBuf,
+        path: PathBuf,
+        requests: mpsc::Receiver<(String, String)>,
+    }
+
+    impl FakeSocket {
+        fn new(name: &str, responses: Vec<(u16, &str)>) -> Self {
+            let responses: Vec<(u16, String)> = responses
+                .into_iter()
+                .map(|(status, body)| (status, body.to_owned()))
+                .collect();
+            let dir =
+                std::env::temp_dir().join(format!("pressboxctl-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("control.sock");
+            let listener = UnixListener::bind(&path).unwrap();
+            let (tx, requests) = mpsc::channel();
+            std::thread::spawn(move || {
+                for (status, body) in responses {
+                    let (stream, _) = listener.accept().unwrap();
+                    let mut reader = BufReader::new(stream);
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let mut length = 0;
+                    loop {
+                        let mut header = String::new();
+                        reader.read_line(&mut header).unwrap();
+                        if header.trim().is_empty() {
+                            break;
+                        }
+                        if let Some(n) = header.to_lowercase().strip_prefix("content-length:") {
+                            length = n.trim().parse().unwrap();
+                        }
+                    }
+                    let mut sent = vec![0; length];
+                    reader.read_exact(&mut sent).unwrap();
+                    tx.send((line.trim().to_owned(), String::from_utf8(sent).unwrap()))
+                        .unwrap();
+                    write!(
+                        reader.get_mut(),
+                        "HTTP/1.1 {status} X\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .unwrap();
+                }
+            });
+            Self {
+                dir,
+                path,
+                requests,
+            }
+        }
+
+        /// Runs `pressboxctl -s <socket> <args>` and returns its output.
+        fn run(&self, args: &[&str]) -> Result<String> {
+            ctl(&[&["-s", self.path.to_str().unwrap()], args].concat())
+        }
+
+        fn request(&self) -> (String, String) {
+            self.requests.recv().unwrap()
+        }
+    }
+
+    impl Drop for FakeSocket {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn ctl(args: &[&str]) -> Result<String> {
+        let args = Args::try_parse_from([&["pressboxctl"], args].concat())?;
+        let mut out = Vec::new();
+        run(args, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn reports_status_users_and_devices() {
+        let now = chrono::Utc::now().timestamp();
+        let devices = format!(
+            r#"[{{"name":"laptop","user":"chris","created":{},"last_seen":{}}},
+                {{"name":"phone","user":"anna","created":{},"last_seen":null}}]"#,
+            now - 3 * 86_400,
+            now - 120,
+            now - 7200
+        );
+        let socket = FakeSocket::new(
+            "status",
+            vec![
+                (
+                    200,
+                    r#"{"feeds":12,"archived_feeds":1,"failing_feeds":2,"items":3400,"users":2,"devices":3,"pending_pairings":1}"#,
+                ),
+                (
+                    200,
+                    r#"[{"name":"anna","admin":false,"devices":1,"feeds":4},{"name":"chris","admin":true,"devices":2,"feeds":8}]"#,
+                ),
+                (200, &devices),
+                (200, &devices),
+                (200, "[]"),
+            ],
+        );
+        let status = socket.run(&["status"]).unwrap();
+        assert_eq!(socket.request().0, "GET /admin/status HTTP/1.1");
+        assert_eq!(
+            status,
+            "feeds:            12 (2 failing)\n\
+             archived feeds:   1 (removed, kept for starred items)\n\
+             items:            3400\n\
+             users:            2\n\
+             devices:          3\n\
+             pending pairings: 1\n"
+        );
+        let users = socket.run(&["users"]).unwrap();
+        assert_eq!(
+            users,
+            concat!(
+                "anna                          4 feeds   1 devices\n",
+                "chris                admin    8 feeds   2 devices\n",
+            )
+        );
+        let all = socket.run(&["devices"]).unwrap();
+        assert!(all.contains("laptop") && all.contains("phone"), "{all}");
+        assert!(
+            all.contains("paired 3d ago") && all.contains("last seen 2m ago"),
+            "{all}"
+        );
+        assert!(
+            all.contains("paired 2h ago") && all.contains("last seen never"),
+            "{all}"
+        );
+        let annas = socket.run(&["devices", "--user", "anna"]).unwrap();
+        assert!(
+            !annas.contains("laptop") && annas.contains("phone"),
+            "{annas}"
+        );
+        assert_eq!(socket.run(&["devices"]).unwrap(), "no devices paired\n");
+    }
+
+    #[test]
+    fn manages_devices_and_pairings() {
+        let socket = FakeSocket::new(
+            "devices",
+            vec![
+                (204, ""),
+                (200, r#"{"name":"tv","user":"anna","token":"secret"}"#),
+                (200, r#"[{"code":"K7W-4QX","name":"phone","requested":0}]"#),
+                (200, "[]"),
+                (200, r#"{"name":"phone","user":"anna"}"#),
+                (204, ""),
+                (
+                    200,
+                    r#"{"path":"/var/backups/pressbox-1.db","removed":["old.db"]}"#,
+                ),
+                (202, ""),
+                (200, "<opml/>\n"),
+            ],
+        );
+        assert_eq!(socket.run(&["revoke", "my pc"]).unwrap(), "revoked my pc\n");
+        assert_eq!(socket.request().0, "DELETE /admin/devices/my%20pc HTTP/1.1");
+
+        let token = socket.run(&["add-device", "tv", "--user", "anna"]).unwrap();
+        assert_eq!(token, "secret\n", "only the token goes to stdout");
+        let (line, body) = socket.request();
+        assert_eq!(line, "POST /admin/devices HTTP/1.1");
+        assert_eq!(body, r#"{"name":"tv","user":"anna"}"#);
+
+        let pending = socket.run(&["pairings"]).unwrap();
+        assert!(pending.starts_with("K7W-4QX  phone"), "{pending}");
+        assert_eq!(socket.run(&["pairings"]).unwrap(), "no pairing requests\n");
+        let _ = (socket.request(), socket.request());
+
+        let approved = socket
+            .run(&["approve", "K7W-4QX", "--user", "anna"])
+            .unwrap();
+        assert_eq!(approved, "paired phone for anna\n");
+        let (line, body) = socket.request();
+        assert_eq!(line, "POST /admin/pairings/K7W-4QX/approve HTTP/1.1");
+        assert_eq!(body, r#"{"user":"anna"}"#);
+
+        assert_eq!(
+            socket.run(&["deny", "ABC-DEF"]).unwrap(),
+            "denied ABC-DEF\n"
+        );
+        assert_eq!(
+            socket.request().0,
+            "DELETE /admin/pairings/ABC-DEF HTTP/1.1"
+        );
+
+        let backup = socket.run(&["backup", "--keep", "3"]).unwrap();
+        assert_eq!(backup, "/var/backups/pressbox-1.db\n");
+        assert_eq!(socket.request().1, r#"{"keep":3}"#);
+
+        assert_eq!(socket.run(&["refresh"]).unwrap(), "refreshing all feeds\n");
+        assert_eq!(socket.request().0, "POST /admin/refresh HTTP/1.1");
+
+        assert_eq!(
+            socket.run(&["opml-export", "--user", "a b"]).unwrap(),
+            "<opml/>\n"
+        );
+        assert_eq!(socket.request().0, "GET /admin/opml?user=a%20b HTTP/1.1");
+    }
+
+    #[test]
+    fn explains_errors() {
+        let socket = FakeSocket::new(
+            "errors",
+            vec![
+                (400, r#"{"error":"no such user"}"#),
+                (500, "plain text"),
+                (404, r#"{"error":"not found"}"#),
+                (200, "not json"),
+            ],
+        );
+        let error = |args: &[&str]| format!("{:#}", socket.run(args).unwrap_err());
+        assert_eq!(
+            error(&["add-device", "tv", "--user", "nobody"]),
+            "pressboxd: no such user (HTTP 400)"
+        );
+        assert_eq!(error(&["status"]), "pressboxd: plain text (HTTP 500)");
+        assert_eq!(
+            error(&["revoke", "ghost"]),
+            "revoking \"ghost\": pressboxd: not found (HTTP 404)"
+        );
+        assert!(error(&["users"]).starts_with("unexpected response: not json"));
+
+        let missing = ctl(&["-s", "/nonexistent/control.sock", "status"]).unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("is pressboxd running"),
+            "{missing:#}"
+        );
+    }
+
+    #[test]
+    fn converts_an_opml_file() {
+        let dir = std::env::temp_dir().join(format!("pressboxctl-opml-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("feeds.opml");
+        std::fs::write(&file, OPML).unwrap();
+        let nix = ctl(&["opml-to-nix", file.to_str().unwrap()]).unwrap();
+        assert_eq!(nix, opml_to_nix(OPML).unwrap());
+        let missing = ctl(&["opml-to-nix", "/nonexistent.opml"]).unwrap_err();
+        assert!(format!("{missing:#}").starts_with("reading /nonexistent.opml"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn says_how_long_ago() {
+        let now = chrono::Utc::now().timestamp();
+        assert_eq!(ago(now - 5), "just now");
+        assert_eq!(ago(now - 600), "10m ago");
+        assert_eq!(ago(now - 3 * 3600), "3h ago");
+        assert_eq!(ago(now - 2 * 86_400), "2d ago");
+    }
+
+    /// Serves `routes` (path, content type, body) on a local port, from its
+    /// own thread and runtime, as `discover` blocks on its own.
+    fn site(routes: Vec<(&'static str, &'static str, String)>) -> String {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let mut app = axum::Router::new();
+                    for (path, kind, body) in routes {
+                        app = app.route(
+                            path,
+                            axum::routing::get(move || async move {
+                                ([(axum::http::header::CONTENT_TYPE, kind)], body)
+                            }),
+                        );
+                    }
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    tx.send(listener.local_addr().unwrap()).unwrap();
+                    axum::serve(listener, app).await.unwrap();
+                });
+        });
+        format!("http://{}", rx.recv().unwrap())
+    }
+
+    #[test]
+    fn discovers_feeds_on_a_site() {
+        const RSS: &str = r#"<rss version="2.0"><channel><title>Blog</title></channel></rss>"#;
+        const ATOM: &str =
+            r#"<feed xmlns="http://www.w3.org/2005/Atom"><title>Blog (Atom)</title></feed>"#;
+        let html = "text/html";
+        let page = r#"<html><head>
+            <link rel="alternate" type="application/rss+xml" href="/posts.rss">
+            <link rel="alternate" type="application/atom+xml" href="/missing.xml">
+            </head></html>"#;
+        let base = site(vec![
+            ("/post", html, page.into()),
+            ("/posts.rss", "application/rss+xml", RSS.into()),
+            ("/plain", html, "<html><body>no links</body></html>".into()),
+            ("/atom.xml", "application/atom+xml", ATOM.into()),
+        ]);
+
+        // Announced feeds; one announced link that 404s is skipped.
+        let found = ctl(&["discover", &format!("{base}/post")]).unwrap();
+        assert!(
+            found.contains(&format!("url = \"{base}/posts.rss\"")),
+            "{found}"
+        );
+        assert!(
+            found.contains("# RSS") && !found.contains("missing"),
+            "{found}"
+        );
+
+        // No links: the usual paths are tried.
+        let guessed = ctl(&["discover", &format!("{base}/plain")]).unwrap();
+        assert!(
+            guessed.contains(&format!("url = \"{base}/atom.xml\"")),
+            "{guessed}"
+        );
+        assert!(
+            guessed.contains("# Atom") && guessed.contains("Blog (Atom)"),
+            "{guessed}"
+        );
+
+        // A feed URL is its own answer.
+        let direct = ctl(&["discover", &format!("{base}/posts.rss")]).unwrap();
+        assert_eq!(direct.matches("url =").count(), 1, "{direct}");
+
+        let empty = site(vec![("/", html, "<html></html>".into())]);
+        let none = ctl(&["discover", &empty]).unwrap_err();
+        assert!(
+            format!("{none:#}").starts_with("no feeds found"),
+            "{none:#}"
+        );
+        let bad = ctl(&["discover", "not a url"]).unwrap_err();
+        assert!(format!("{bad:#}").contains("is not a URL"), "{bad:#}");
+        let down = ctl(&["discover", &format!("{empty}/nothing-here")]).unwrap_err();
+        assert!(format!("{down:#}").starts_with("fetching"), "{down:#}");
+    }
 
     const OPML: &str = r#"<?xml version="1.0"?>
         <opml version="2.0"><head><title>Feedly</title></head><body>

@@ -66,10 +66,11 @@ pub struct Session {
     pub token: String,
 }
 
-/// Loads the saved session: the server from `client.json` and its token.
-pub fn load_session() -> (ClientConfig, Option<Session>) {
-    let config = ClientConfig::default_path()
-        .and_then(|p| ClientConfig::load(&p).ok())
+/// Loads the saved session: the server from `client.json` at `path` (an
+/// unreadable file counts as empty) and its token.
+pub fn load_session(path: Option<&Path>) -> (ClientConfig, Option<Session>) {
+    let config = path
+        .and_then(|p| ClientConfig::load(p).ok())
         .unwrap_or_default();
     let session = match (&config.server, config.token()) {
         (Some(server), Some(token)) => Some(Session {
@@ -82,16 +83,17 @@ pub fn load_session() -> (ClientConfig, Option<Session>) {
 }
 
 /// Saves a newly paired session. The token goes to the token file (mode
-/// 0600); the server is written to `client.json` only if it has none, so a
-/// file managed by Home Manager is left alone.
-pub fn save_session(config: &ClientConfig, session: &Session) -> Result<()> {
+/// 0600); the server is written to `client.json` at `path` only if the
+/// config doesn't already name it, so a file managed by Home Manager is left
+/// alone.
+pub fn save_session(config: &ClientConfig, path: Option<&Path>, session: &Session) -> Result<()> {
     let token_path = config
         .token_path()
         .context("no state directory for the token")?;
     write_private(&token_path, &format!("{}\n", session.token))?;
 
     if config.server.as_deref() != Some(session.server.as_str()) {
-        let path = ClientConfig::default_path().context("no config directory")?;
+        let path = path.context("no config directory")?;
         let updated = ClientConfig {
             server: Some(session.server.clone()),
             token_file: config.token_file.clone(),
@@ -99,7 +101,7 @@ pub fn save_session(config: &ClientConfig, session: &Session) -> Result<()> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        std::fs::write(&path, serde_json::to_string_pretty(&updated)? + "\n")
+        std::fs::write(path, serde_json::to_string_pretty(&updated)? + "\n")
             .with_context(|| format!("writing {}", path.display()))?;
     }
     Ok(())
@@ -161,6 +163,51 @@ mod tests {
             let mode = std::fs::metadata(&token).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn saves_and_loads_a_session() {
+        let dir =
+            std::env::temp_dir().join(format!("pressbox-iced-session-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config/client.json");
+        let config = ClientConfig {
+            server: None,
+            token_file: Some(dir.join("state/token")),
+        };
+        let session = Session {
+            server: "https://rss.example".into(),
+            token: "secret".into(),
+        };
+        assert_eq!(load_session(Some(&path)), (ClientConfig::default(), None));
+
+        save_session(&config, Some(&path), &session).unwrap();
+        let saved = ClientConfig::load(&path).unwrap();
+        assert_eq!(saved.server.as_deref(), Some("https://rss.example"));
+        assert_eq!(saved.token_file, config.token_file, "keeps the token file");
+        assert_eq!(
+            load_session(Some(&path)),
+            (saved.clone(), Some(session.clone()))
+        );
+
+        // A config that already names the server isn't rewritten.
+        std::fs::write(
+            &path,
+            "{ \"server\": \"https://rss.example\", \"tokenFile\": \"",
+        )
+        .unwrap();
+        save_session(&saved, Some(&path), &session).unwrap();
+        assert!(ClientConfig::load(&path).is_err(), "left as it was");
+        assert_eq!(load_session(Some(&path)).1, None, "unreadable: not paired");
+
+        // Nowhere to write the server.
+        let elsewhere = Session {
+            server: "https://other.example".into(),
+            ..session
+        };
+        assert!(save_session(&config, None, &elsewhere).is_err());
+        assert_eq!(load_session(None), (ClientConfig::default(), None));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
