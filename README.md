@@ -44,8 +44,8 @@ NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items
   feeds are fetched, systemd
 - [Pairing devices](./docs/pairing.md): giving each client its own token
 - [pressboxctl](./docs/pressboxctl.md): the admin CLI on the server
-- [Clients (Home Manager)](./docs/clients.md): the terminal and desktop
-  clients and the Birdland bar
+- [Clients (Home Manager)](./docs/clients.md): the terminal and desktop clients
+  and the Birdland bar
 - [API](./docs/api.md): the HTTP API clients use
 
 ## iOS
@@ -139,8 +139,8 @@ generates: `listen`, `database`, `refresh_interval`, `max_items_per_feed`,
 `[users.<name>]` with `admin` and `[users.<name>.feeds.<id>]`) and run
 `just server` (or `cargo run -p pressboxd -- -c pressbox.toml`). The control
 socket defaults to `pressbox.sock` next to the database:
-`just ctl -s ./pressbox.sock status`. `just tui` and `just gui` run the
-terminal and desktop clients the same way.
+`just ctl -s ./pressbox.sock status`. `just tui` and `just gui` run the terminal
+and desktop clients the same way.
 
 ## License
 

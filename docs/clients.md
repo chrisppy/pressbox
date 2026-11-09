@@ -21,8 +21,8 @@ saves the token to `$XDG_STATE_HOME/pressbox/token`; set `tokenFile` only to use
 a token from somewhere else. Both clients read these files, so pairing one pairs
 both.
 
-Set `desktop.enable = true` to also install `pressbox-iced`, the desktop
-client, and `tui.enable = false` to leave out the terminal one.
+Set `desktop.enable = true` to also install `pressbox-iced`, the desktop client,
+and `tui.enable = false` to leave out the terminal one.
 
 ### pressbox (terminal client)
 
@@ -61,7 +61,7 @@ code, ask the server to refetch every feed, and sign out, which deletes the
 token.
 
 | Key | Action |
-| --------- | ------------------- |
+| --------- | ----------------- |
 | `j` / `↓` | Next item |
 | `k` / `↑` | Previous item |
 | `s` | Toggle star |

@@ -71,7 +71,6 @@ in
     );
 
     home.packages =
-      lib.optional cfg.tui.enable cfg.tui.package
-      ++ lib.optional cfg.desktop.enable cfg.desktop.package;
+      lib.optional cfg.tui.enable cfg.tui.package ++ lib.optional cfg.desktop.enable cfg.desktop.package;
   };
 }
