@@ -134,20 +134,43 @@ _: {
         default = pressboxd;
       };
 
-      # Together the same as `just lint`.
-      checks.clippy = craneLib.cargoClippy (
-        serverArgs
-        // {
-          inherit cargoArtifacts;
-          cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-        }
-      );
-      checks.clippy-iced = craneLib.cargoClippy (
-        guiArgs
-        // {
-          cargoArtifacts = guiArtifacts;
-          cargoClippyExtraArgs = "--all-targets -- --deny warnings";
-        }
-      );
+      checks = {
+        # Together the same as `just lint`.
+        clippy = craneLib.cargoClippy (
+          serverArgs
+          // {
+            inherit cargoArtifacts;
+            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+          }
+        );
+        clippy-iced = craneLib.cargoClippy (
+          guiArgs
+          // {
+            cargoArtifacts = guiArtifacts;
+            cargoClippyExtraArgs = "--all-targets -- --deny warnings";
+          }
+        );
+      }
+      // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        # Line coverage of the whole workspace, as `just coverage` measures
+        # it, which must stay at 100%: new code comes with tests, or is marked
+        # `#[cfg(not(tarpaulin_include))]` with the reason. Linux only, where
+        # CI runs it. The instrumented build shares nothing with the others,
+        # so it inherits no artifacts.
+        coverage = craneLib.cargoTarpaulin (
+          commonArgs
+          // {
+            cargoArtifacts = null;
+            doInstallCargoArtifacts = false;
+            # The code as written, not as optimized away.
+            CARGO_PROFILE = "dev";
+            cargoExtraArgs = "--locked --workspace";
+            cargoTarpaulinExtraArgs = "--engine llvm --fail-under 100 --skip-clean --out xml --output-dir $out";
+            # Tarpaulin runs the tests in the build phase, so the CA bundle
+            # (see commonArgs) is needed there.
+            nativeBuildInputs = [ pkgs.cacert ];
+          }
+        );
+      };
     };
 }

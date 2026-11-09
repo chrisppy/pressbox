@@ -121,9 +121,10 @@ just test            # cargo test
 just lint            # clippy, warnings as errors
 just fmt             # devfmt's treefmt setup
 just deny            # advisories, licenses, duplicate crates, sources
-just check           # nix flake check: builds, module checks, NixOS VM test
+just check           # nix flake check: builds, module checks, NixOS VM test,
+                     # coverage
 just verify          # all of the above, as CI does
-just coverage        # line coverage per file (cargo-tarpaulin); 100% is the bar
+just coverage        # line coverage per file; fails below 100%, as CI does
 ```
 
 `cargo deny` also runs in CI on every push and weekly, so a new advisory against
