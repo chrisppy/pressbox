@@ -19,6 +19,7 @@
 //! | POST   | /admin/refresh                 |                 | 202                |
 
 use std::{
+    fmt::Write as _,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     sync::Arc,
@@ -33,8 +34,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use pressbox_api::{
-    ApproveRequest, Approved, BackupRequest, BackupResult, Device, NewDevice, NewDeviceRequest,
-    Status, UserInfo,
+    ApproveRequest, Approved, BackupRequest, BackupResult, Device, Feed, NewDevice,
+    NewDeviceRequest, Status, UserInfo,
 };
 
 use crate::{
@@ -84,7 +85,7 @@ pub fn bind(path: &Path) -> Result<tokio::net::UnixListener> {
 }
 
 async fn status(State(state): State<Arc<AppState>>) -> ApiResult<Json<Status>> {
-    let counts = state.reader().counts()?;
+    let counts = state.read(|db| db.counts()).await?;
     Ok(Json(Status {
         feeds: counts.feeds,
         archived_feeds: counts.archived_feeds,
@@ -97,22 +98,27 @@ async fn status(State(state): State<Arc<AppState>>) -> ApiResult<Json<Status>> {
 }
 
 async fn users(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<UserInfo>>> {
-    Ok(Json(state.reader().users()?))
+    Ok(Json(state.read(|db| db.users()).await?))
 }
 
 async fn devices(State(state): State<Arc<AppState>>) -> ApiResult<Json<Vec<Device>>> {
-    Ok(Json(state.reader().devices()?))
+    Ok(Json(state.read(|db| db.devices()).await?))
 }
 
 /// The named user, or the only user when none is named.
-fn pick_user(state: &AppState, name: Option<&str>) -> ApiResult<AuthUser> {
-    let db = state.db();
-    match name {
-        Some(name) => db.user(name)?.ok_or(ApiError::BadRequest("no such user")),
-        None => db.only_user()?.ok_or(ApiError::BadRequest(
-            "there is more than one user; say which with --user",
-        )),
-    }
+async fn pick_user(state: &Arc<AppState>, name: Option<String>) -> ApiResult<AuthUser> {
+    let named = name.is_some();
+    let user = state
+        .read(move |db| match name {
+            Some(name) => db.user(&name),
+            None => db.only_user(),
+        })
+        .await?;
+    user.ok_or(ApiError::BadRequest(if named {
+        "no such user"
+    } else {
+        "there is more than one user; say which with --user"
+    }))
 }
 
 async fn add_device(
@@ -122,13 +128,11 @@ async fn add_device(
     let name = pairing::device_name(&req.name).ok_or(ApiError::BadRequest(
         "name must be 1-40 letters, digits, '-', '_' or '.'",
     ))?;
-    let user = pick_user(&state, req.user.as_deref())?;
-    Ok(Json(pairing::create_device(
-        &state.db(),
-        &user,
-        &name,
-        now(),
-    )?))
+    let user = pick_user(&state, req.user).await?;
+    let device = state
+        .write(move |db| pairing::create_device(db, &user, &name, now()))
+        .await?;
+    Ok(Json(device))
 }
 
 async fn approve(
@@ -137,15 +141,16 @@ async fn approve(
     body: Option<Json<ApproveRequest>>,
 ) -> ApiResult<Json<Approved>> {
     let wanted = body.and_then(|Json(b)| b.user);
-    let user = pick_user(&state, wanted.as_deref())?;
-    api::approve_for(&state, &code, &user)
+    let user = pick_user(&state, wanted).await?;
+    api::approve_for(&state, code, user).await
 }
 
 async fn remove_device(
     State(state): State<Arc<AppState>>,
     UrlPath(name): UrlPath<String>,
 ) -> ApiResult<StatusCode> {
-    let removed = state.db().remove_device(&name)?;
+    let target = name.clone();
+    let removed = state.write(move |db| db.remove_device(&target)).await?;
     if removed {
         tracing::info!("revoked device {name:?}");
     }
@@ -209,35 +214,261 @@ async fn opml(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<OpmlQuery>,
 ) -> ApiResult<impl IntoResponse> {
-    let user = pick_user(&state, query.user.as_deref())?;
-    let feeds = state.reader().feeds(user.id)?;
-    let mut doc = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<opml version=\"2.0\">\n  <head><title>pressbox feeds</title></head>\n  <body>\n",
-    );
+    let user = pick_user(&state, query.user).await?;
+    let feeds = state.read(move |db| db.feeds(user.id)).await?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/x-opml; charset=utf-8")],
+        opml_document(&feeds),
+    ))
+}
+
+/// An OPML 2.0 list of the feeds still followed (not archived ones).
+fn opml_document(feeds: &[Feed]) -> String {
+    let mut doc = String::from(concat!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+        "<opml version=\"2.0\">\n",
+        "  <head><title>pressbox feeds</title></head>\n",
+        "  <body>\n",
+    ));
+    // Writing to a String cannot fail.
     for feed in feeds.iter().filter(|f| !f.archived) {
-        let mut attrs = format!(
-            "text=\"{t}\" title=\"{t}\" type=\"rss\" xmlUrl=\"{u}\"",
-            t = xml_escape(&feed.title),
-            u = xml_escape(&feed.url)
+        let title = xml_escape(&feed.title);
+        let _ = write!(
+            doc,
+            "    <outline text=\"{title}\" title=\"{title}\" type=\"rss\" xmlUrl=\"{}\"",
+            xml_escape(&feed.url)
         );
         if let Some(site) = &feed.site_url {
-            attrs.push_str(&format!(" htmlUrl=\"{}\"", xml_escape(site)));
+            let _ = write!(doc, " htmlUrl=\"{}\"", xml_escape(site));
         }
         if !feed.tags.is_empty() {
-            attrs.push_str(&format!(
-                " category=\"{}\"",
-                xml_escape(&feed.tags.join(","))
-            ));
+            let _ = write!(doc, " category=\"{}\"", xml_escape(&feed.tags.join(",")));
         }
-        doc.push_str(&format!("    <outline {attrs}/>\n"));
+        doc.push_str("/>\n");
     }
     doc.push_str("  </body>\n</opml>\n");
-    Ok(([(header::CONTENT_TYPE, "text/x-opml; charset=utf-8")], doc))
+    doc
 }
 
 #[cfg(test)]
 mod tests {
+    use axum::{body::Body, http::Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::{config::Config, db::Db};
+
+    const TWO_USERS: &str = r#"
+        [users.chris]
+        admin = true
+        [users.chris.feeds.blog]
+        url = "https://blog.example/feed"
+        title = "Tom & Jerry's <blog>"
+        tags = ["fun", "cats"]
+        [users.anna]
+    "#;
+
+    fn state(config: &str, backup_dir: &Path) -> Arc<AppState> {
+        let mut db = Db::open_in_memory().unwrap();
+        db.sync(&Config::parse(config).unwrap()).unwrap();
+        let mut state = AppState::new(db, None, 100).unwrap();
+        state.backup_dir = backup_dir.to_owned();
+        Arc::new(state)
+    }
+
+    async fn call(
+        state: &Arc<AppState>,
+        method: &str,
+        uri: &str,
+        body: Option<&str>,
+    ) -> (StatusCode, String) {
+        let mut req = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            req = req.header(header::CONTENT_TYPE, "application/json");
+        }
+        let body = body.map_or_else(Body::empty, |b| Body::from(b.to_owned()));
+        let resp = router(state.clone())
+            .oneshot(req.body(body).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8(bytes.to_vec()).unwrap())
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("pressboxd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn devices_and_status() {
+        let s = state(TWO_USERS, &temp_dir("unused"));
+        let (status, body) = call(&s, "GET", "/admin/users", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let users: Vec<UserInfo> = serde_json::from_str(&body).unwrap();
+        assert_eq!(users.len(), 2);
+
+        // With two users, one has to be named.
+        let (status, body) = call(&s, "POST", "/admin/devices", Some(r#"{"name":"pc"}"#)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("--user"), "{body}");
+        for (request, why) in [
+            (r#"{"name":"pc","user":"nobody"}"#, "unknown user"),
+            (r#"{"name":"a/b","user":"anna"}"#, "bad name"),
+        ] {
+            let (status, _) = call(&s, "POST", "/admin/devices", Some(request)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{why}");
+        }
+        let add = Some(r#"{"name":"my pc","user":"anna"}"#);
+        let (status, body) = call(&s, "POST", "/admin/devices", add).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let device: NewDevice = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (device.name.as_str(), device.user.as_str()),
+            ("my-pc", "anna")
+        );
+        let who = s
+            .reader()
+            .authenticate(&pairing::hash_token(&device.token), now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(who.name, "anna", "the token works");
+        let (_, body) = call(&s, "POST", "/admin/devices", add).await;
+        let again: NewDevice = serde_json::from_str(&body).unwrap();
+        assert_eq!(again.name, "my-pc-2", "names are made unique");
+
+        let (_, body) = call(&s, "GET", "/admin/devices", None).await;
+        let devices: Vec<Device> = serde_json::from_str(&body).unwrap();
+        assert_eq!(devices.len(), 2);
+
+        let (_, body) = call(&s, "GET", "/admin/status", None).await;
+        let status: Status = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            (
+                status.feeds,
+                status.users,
+                status.devices,
+                status.pending_pairings
+            ),
+            (1, 2, 2, 0)
+        );
+
+        let (status, _) = call(&s, "DELETE", "/admin/devices/my-pc", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = call(&s, "DELETE", "/admin/devices/my-pc", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = call(&s, "POST", "/admin/refresh", None).await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn approves_pairings_for_a_user() {
+        let s = state(TWO_USERS, &temp_dir("unused"));
+        let start = s.pairings.start("phone", "10.0.0.2", now()).unwrap();
+        let (_, body) = call(&s, "GET", "/admin/pairings", None).await;
+        assert!(body.contains("phone"), "{body}");
+
+        let uri = format!("/admin/pairings/{}/approve", start.code);
+        let (status, _) = call(&s, "POST", &uri, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "two users: say which");
+        let (status, body) = call(&s, "POST", &uri, Some(r#"{"user":"anna"}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let approved: Approved = serde_json::from_str(&body).unwrap();
+        assert_eq!(approved.user, "anna");
+        let (status, _) = call(&s, "POST", &uri, Some(r#"{"user":"anna"}"#)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "only once");
+
+        let denied = s.pairings.start("tablet", "10.0.0.2", now()).unwrap();
+        let uri = format!("/admin/pairings/{}", denied.code);
+        assert_eq!(
+            call(&s, "DELETE", &uri, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            call(&s, "DELETE", &uri, None).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn exports_opml() {
+        let s = state(TWO_USERS, &temp_dir("unused"));
+        let (status, body) = call(&s, "GET", "/admin/opml?user=chris", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("<?xml"), "{body}");
+        assert!(
+            body.contains(
+                r#"<outline text="Tom &amp; Jerry's &lt;blog&gt;" title="Tom &amp; Jerry's &lt;blog&gt;" type="rss" xmlUrl="https://blog.example/feed" category="fun,cats"/>"#
+            ),
+            "{body}"
+        );
+        let (_, body) = call(&s, "GET", "/admin/opml?user=anna", None).await;
+        assert!(!body.contains("<outline"), "anna follows nothing: {body}");
+        let (status, _) = call(&s, "GET", "/admin/opml", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "two users: say which");
+    }
+
+    #[test]
+    fn opml_leaves_out_archived_feeds_and_escapes() {
+        let feed = |id: &str, archived| Feed {
+            id: id.into(),
+            title: format!("\"{id}\""),
+            url: format!("https://{id}.example/?a=1&b=2"),
+            site_url: Some(format!("https://{id}.example/")),
+            tags: Vec::new(),
+            unread: 0,
+            total: 0,
+            last_fetched: None,
+            last_error: None,
+            archived,
+        };
+        let doc = opml_document(&[feed("kept", false), feed("old", true)]);
+        assert!(doc.contains(r#"title="&quot;kept&quot;""#), "{doc}");
+        assert!(
+            doc.contains(r#"xmlUrl="https://kept.example/?a=1&amp;b=2""#),
+            "{doc}"
+        );
+        assert!(doc.contains(r#"htmlUrl="https://kept.example/""#), "{doc}");
+        assert!(!doc.contains("category"), "no tags, no category: {doc}");
+        assert!(!doc.contains("old"), "{doc}");
+        assert!(doc.ends_with("</opml>\n"));
+    }
+
+    #[tokio::test]
+    async fn backs_up_and_keeps_the_newest() {
+        let dir = temp_dir("backup");
+        let s = state("[feeds.a]\nurl = \"https://a.example/\"", &dir);
+        let (status, body) = call(&s, "POST", "/admin/backup", Some(r#"{"keep":1}"#)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let first: BackupResult = serde_json::from_str(&body).unwrap();
+        assert!(first.removed.is_empty());
+        let copy = Db::open(Path::new(&first.path)).unwrap();
+        assert_eq!(copy.counts().unwrap().feeds, 1, "a working database");
+        drop(copy);
+
+        let (_, body) = call(&s, "POST", "/admin/backup", Some(r#"{"keep":0}"#)).await;
+        let second: BackupResult = serde_json::from_str(&body).unwrap();
+        assert_ne!(second.path, first.path);
+        assert_eq!(second.removed, [first.path], "keep 0 still keeps one");
+        assert!(Path::new(&second.path).exists());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn binds_a_private_socket_over_a_stale_one() {
+        let dir = temp_dir("socket");
+        let path = dir.join("sub/control.sock");
+        drop(bind(&path).unwrap());
+        assert!(path.exists(), "left behind, as after a crash");
+        let _listener = bind(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn prunes_oldest_backups() {

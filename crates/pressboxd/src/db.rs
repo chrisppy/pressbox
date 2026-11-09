@@ -306,13 +306,14 @@ impl Db {
             let tx = self.conn.transaction()?;
             tx.execute_batch(sql)
                 .with_context(|| format!("database migration {}", i + 1))?;
-            tx.pragma_update(None, "user_version", i64::try_from(i + 1)?)?;
+            let number = i + 1;
+            tx.pragma_update(None, "user_version", i64::try_from(number)?)?;
             tx.commit()?;
-            if i + 1 == 2 {
-                self.reindex_all()?;
-            }
-            if i + 1 == 4 {
-                self.rebuild_search()?;
+            // Data work a migration's comment promises, done in Rust.
+            match number {
+                2 => self.reindex_all()?,
+                4 => self.rebuild_search()?,
+                _ => {}
             }
         }
         let broken: Option<String> = self
@@ -357,8 +358,7 @@ impl Db {
             let mut update =
                 tx.prepare("UPDATE items SET summary = ?2, content = ?3 WHERE id = ?1")?;
             tx.execute("DELETE FROM items_fts", [])?;
-            let mut index =
-                tx.prepare("INSERT INTO items_fts (rowid, title, body) VALUES (?1, ?2, ?3)")?;
+            let mut index = tx.prepare(FTS_INSERT)?;
             for (id, title, summary, content, item_url, feed_url) in rows {
                 let base = sanitize::base_url(item_url.as_deref(), &feed_url);
                 let summary = summary.map(|s| sanitize::html(&s, Some(&base)));
@@ -382,8 +382,7 @@ impl Db {
             tx.execute("DELETE FROM items_fts", [])?;
             let mut select =
                 tx.prepare("SELECT id, title, url, author, summary, content FROM items")?;
-            let mut index =
-                tx.prepare("INSERT INTO items_fts (rowid, title, body) VALUES (?1, ?2, ?3)")?;
+            let mut index = tx.prepare(FTS_INSERT)?;
             let mut set_digest = tx.prepare("UPDATE items SET digest = ?2 WHERE id = ?1")?;
             let mut rows = select.query([])?;
             while let Some(r) = rows.next()? {
@@ -664,9 +663,8 @@ impl Db {
             )?;
             let mut set_source_digest =
                 tx.prepare("UPDATE items SET source_digest = ?2 WHERE id = ?1")?;
-            let mut unindex = tx.prepare("DELETE FROM items_fts WHERE rowid = ?1")?;
-            let mut index =
-                tx.prepare("INSERT INTO items_fts (rowid, title, body) VALUES (?1, ?2, ?3)")?;
+            let mut unindex = tx.prepare(FTS_DELETE)?;
+            let mut index = tx.prepare(FTS_INSERT)?;
             for (item, source_digest) in items {
                 let stored: Option<(i64, String, i64, String)> = existing
                     .query_row(params![source, item.guid], |r| {
@@ -774,11 +772,8 @@ impl Db {
                 .query_row("SELECT title FROM items WHERE id = ?1", [id], |r| r.get(0))
                 .optional()?;
             if let Some(title) = title {
-                tx.execute("DELETE FROM items_fts WHERE rowid = ?1", [id])?;
-                tx.execute(
-                    "INSERT INTO items_fts (rowid, title, body) VALUES (?1, ?2, ?3)",
-                    params![id, title, sanitize::text(article)],
-                )?;
+                tx.execute(FTS_DELETE, [id])?;
+                tx.execute(FTS_INSERT, params![id, title, sanitize::text(article)])?;
             }
         }
         tx.commit()?;
@@ -843,7 +838,7 @@ impl Db {
             Some(false) => clauses.push("COALESCE(st.starred, 0) = 0"),
             None => {}
         }
-        let mut from = ITEMS_FOR_USER.to_owned();
+        let mut index = "";
         if let Some(fts) = query.q.as_deref().and_then(fts_query) {
             if query.feed.is_none() && query.starred != Some(true) {
                 // Walk items newest first and stop after a page, checking
@@ -851,7 +846,7 @@ impl Db {
                 // a common word matches most items (300ms -> 16ms on 100k
                 // items), and no match at all costs one index scan (~5ms).
                 // A feed or starred filter has a narrower index to start from.
-                from = from.replacen("items i", "items i INDEXED BY items_by_date", 1);
+                index = "INDEXED BY items_by_date";
                 clauses.push("+i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
             } else {
                 clauses.push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
@@ -871,7 +866,7 @@ impl Db {
         args.push(Box::new(limit + 1));
         args.push(Box::new(offset));
         let sql = format!(
-            "SELECT {ITEM_COLUMNS}, NULL FROM {from}
+            "SELECT {ITEM_COLUMNS}, NULL FROM items i {index} {USER_JOINS}
              WHERE {} ORDER BY i.published DESC, i.id DESC LIMIT ? OFFSET ?",
             clauses.join(" AND ")
         );
@@ -897,41 +892,43 @@ impl Db {
     pub fn item(&self, user: i64, id: i64) -> Result<Option<Item>> {
         Ok(self
             .conn
-            .query_row(
-                &format!(
-                    "SELECT {ITEM_COLUMNS}, COALESCE(NULLIF(i.full_content, ''), i.content)
-                     FROM {ITEMS_FOR_USER}
-                     WHERE i.id = ?2 AND {VISIBLE}"
-                ),
-                params![user, id],
-                item_from_row,
-            )
+            .prepare_cached(&format!(
+                "SELECT {ITEM_COLUMNS}, COALESCE(NULLIF(i.full_content, ''), i.content)
+                 FROM items i {USER_JOINS}
+                 WHERE i.id = ?2 AND {VISIBLE}"
+            ))?
+            .query_row(params![user, id], item_from_row)
             .optional()?)
     }
 
-    fn set_flag(&self, user: i64, id: i64, column: &str, value: bool) -> Result<bool> {
-        if self.item(user, id)?.is_none() {
-            return Ok(false);
-        }
-        self.conn.execute(
-            &format!(
-                "INSERT INTO item_state (user_id, item_id, {column}) VALUES (?1, ?2, ?3)
+    /// Sets `read` or `starred` for one item in one statement, which writes
+    /// nothing (and returns false) if the user cannot see the item. Checking
+    /// visibility with `item` first would read the item's whole text.
+    fn set_flag(&self, user: i64, id: i64, column: Flag, value: bool) -> Result<bool> {
+        let column = column.column();
+        // The WHERE clause also keeps SQLite from reading `ON CONFLICT` as
+        // part of the join.
+        let changed = self
+            .conn
+            .prepare_cached(&format!(
+                "INSERT INTO item_state (user_id, item_id, {column})
+                 SELECT ?1, i.id, ?3 FROM items i {USER_JOINS}
+                 WHERE i.id = ?2 AND {VISIBLE}
                  ON CONFLICT (user_id, item_id) DO UPDATE SET {column} = excluded.{column}"
-            ),
-            params![user, id, value],
-        )?;
-        Ok(true)
+            ))?
+            .execute(params![user, id, value])?;
+        Ok(changed > 0)
     }
 
     /// Returns false if the user cannot see that item.
     pub fn set_read(&self, user: i64, id: i64, read: bool) -> Result<bool> {
-        self.set_flag(user, id, "read", read)
+        self.set_flag(user, id, Flag::Read, read)
     }
 
     /// Returns false if the user cannot see that item. Unstarring the last
     /// starred item of a removed feed drops the feed for that user.
     pub fn set_starred(&self, user: i64, id: i64, starred: bool) -> Result<bool> {
-        let changed = self.set_flag(user, id, "starred", starred)?;
+        let changed = self.set_flag(user, id, Flag::Starred, starred)?;
         if changed && !starred {
             collect_garbage(&self.conn)?;
         }
@@ -952,20 +949,16 @@ impl Db {
         let Some(source) = source else {
             return Ok(None);
         };
-        let unread: u32 = self.conn.query_row(
-            "SELECT COUNT(*) FROM items i
-             LEFT JOIN item_state st ON st.item_id = i.id AND st.user_id = ?1
-             WHERE i.source = ?2 AND COALESCE(st.read, 0) = 0",
-            params![user, source],
-            |r| r.get(0),
-        )?;
-        self.conn.execute(
+        // Touches only the unread items, so the rows changed are the count.
+        let marked = self.conn.execute(
             "INSERT INTO item_state (user_id, item_id, read)
-             SELECT ?1, id, 1 FROM items WHERE source = ?2
+             SELECT ?1, i.id, 1 FROM items i
+             LEFT JOIN item_state st ON st.item_id = i.id AND st.user_id = ?1
+             WHERE i.source = ?2 AND COALESCE(st.read, 0) = 0
              ON CONFLICT (user_id, item_id) DO UPDATE SET read = 1",
             params![user, source],
         )?;
-        Ok(Some(unread))
+        Ok(Some(u32::try_from(marked)?))
     }
 
     pub fn counts(&self) -> Result<Counts> {
@@ -1017,14 +1010,7 @@ impl Db {
             .query_row(
                 "SELECT id, name, admin FROM users WHERE name = ?1",
                 [name],
-                |r| {
-                    Ok(AuthUser {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        admin: r.get(2)?,
-                        device: None,
-                    })
-                },
+                user_from_row,
             )
             .optional()?)
     }
@@ -1034,28 +1020,19 @@ impl Db {
     pub fn static_token_user(&self) -> Result<Option<AuthUser>> {
         Ok(self
             .conn
-            .query_row(
-                "SELECT id, name, admin FROM users ORDER BY admin DESC, name LIMIT 1",
-                [],
-                |r| {
-                    Ok(AuthUser {
-                        id: r.get(0)?,
-                        name: r.get(1)?,
-                        admin: r.get(2)?,
-                        device: None,
-                    })
-                },
-            )
+            .prepare_cached("SELECT id, name, admin FROM users ORDER BY admin DESC, name LIMIT 1")?
+            .query_row([], user_from_row)
             .optional()?)
     }
 
     /// The only user, if there is exactly one.
     pub fn only_user(&self) -> Result<Option<AuthUser>> {
-        let users = self.users()?;
-        match users.as_slice() {
-            [only] => self.user(&only.name),
-            _ => Ok(None),
-        }
+        let users: Vec<AuthUser> = self
+            .conn
+            .prepare("SELECT id, name, admin FROM users LIMIT 2")?
+            .query_map([], user_from_row)?
+            .collect::<Result<_, _>>()?;
+        Ok(<[_; 1]>::try_from(users).ok().map(|[only]| only))
     }
 
     /// Registers a device for a user. If `name` is taken, `name-2`,
@@ -1083,25 +1060,21 @@ impl Db {
     /// (older than a minute) and worth updating. Read-only, so it can run on
     /// the read pool for every request.
     pub fn find_device(&self, token_hash: &str, now: i64) -> Result<Option<(AuthUser, bool)>> {
+        // Runs on every request, so the statement is kept prepared.
         Ok(self
             .conn
-            .query_row(
+            .prepare_cached(
                 "SELECT u.id, u.name, u.admin, d.name, d.last_seen FROM devices d
                  JOIN users u ON u.id = d.user_id WHERE d.token_hash = ?1",
-                [token_hash],
-                |r| {
-                    let last_seen: Option<i64> = r.get(4)?;
-                    Ok((
-                        AuthUser {
-                            id: r.get(0)?,
-                            name: r.get(1)?,
-                            admin: r.get(2)?,
-                            device: Some(r.get(3)?),
-                        },
-                        last_seen.is_none_or(|seen| seen < now - 60),
-                    ))
-                },
-            )
+            )?
+            .query_row([token_hash], |r| {
+                let last_seen: Option<i64> = r.get(4)?;
+                let user = AuthUser {
+                    device: Some(r.get(3)?),
+                    ..user_from_row(r)?
+                };
+                Ok((user, last_seen.is_none_or(|seen| seen < now - 60)))
+            })
             .optional()?)
     }
 
@@ -1182,12 +1155,18 @@ pub fn hash_fields(parts: &[Option<&str>]) -> String {
             None => hasher.update([0]),
         }
     }
-    hasher
-        .finalize()
-        .iter()
-        .take(16)
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex(&hasher.finalize()[..16])
+}
+
+/// Lowercase hex of some bytes.
+pub fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from(DIGITS[usize::from(b >> 4)]));
+        s.push(char::from(DIGITS[usize::from(b & 0xf)]));
+    }
+    s
 }
 
 /// A `next_cursor` from `items`: the (published, id) of the last item sent.
@@ -1234,15 +1213,38 @@ fn fts_query(input: &str) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" "))
 }
 
-/// Item columns as one user sees them. Needs `?1` bound to the user's id.
+/// Item columns as one user sees them, from `items i` with [`USER_JOINS`].
 const ITEM_COLUMNS: &str =
     "i.id, COALESCE(s.feed_id, i.source), i.title, i.url, i.author, i.summary,
      i.published, COALESCE(st.read, 0), COALESCE(st.starred, 0)";
 
-/// Items one user may see, joined with their subscription and state.
-const ITEMS_FOR_USER: &str = "items i
+/// Follows `items i`: joins each item with one user's subscription (`s`)
+/// and state (`st`). Needs `?1` bound to the user's id.
+const USER_JOINS: &str = "
      LEFT JOIN subscriptions s ON s.source = i.source AND s.user_id = ?1
      LEFT JOIN item_state st ON st.item_id = i.id AND st.user_id = ?1";
+
+/// Adds an item's text to the search index: (rowid, title, body).
+const FTS_INSERT: &str = "INSERT INTO items_fts (rowid, title, body) VALUES (?1, ?2, ?3)";
+/// Removes an item from the search index before it is indexed again.
+const FTS_DELETE: &str = "DELETE FROM items_fts WHERE rowid = ?1";
+
+/// The per-user flags on an item.
+#[derive(Debug, Clone, Copy)]
+enum Flag {
+    Read,
+    Starred,
+}
+
+impl Flag {
+    /// Its `item_state` column. Only these fixed names are ever put in SQL.
+    const fn column(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Starred => "starred",
+        }
+    }
+}
 
 /// A user sees items of the feeds they follow, of removed feeds only their
 /// starred ones, and every item they starred.
@@ -1266,6 +1268,16 @@ fn collect_garbage(conn: &Connection) -> Result<()> {
            AND NOT EXISTS (SELECT 1 FROM items WHERE source = sources.url);",
     )?;
     Ok(())
+}
+
+/// An [`AuthUser`] from `id, name, admin` columns, without a device.
+fn user_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuthUser> {
+    Ok(AuthUser {
+        id: r.get(0)?,
+        name: r.get(1)?,
+        admin: r.get(2)?,
+        device: None,
+    })
 }
 
 fn item_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
@@ -1510,6 +1522,17 @@ mod tests {
             "not anna's feed id"
         );
         assert_eq!((unread(chris), unread(anna)), (1, 0));
+        // Only what was still unread counts: chris had read one of two.
+        assert_eq!(db.mark_feed_read(chris, "a").unwrap(), Some(1));
+        assert_eq!(db.mark_feed_read(chris, "a").unwrap(), Some(0));
+        // Marking read keeps a star.
+        db.set_starred(anna, a1, true).unwrap();
+        db.set_read(anna, a1, false).unwrap();
+        assert_eq!(db.mark_feed_read(anna, "a").unwrap(), Some(1));
+        let starred = db.item(anna, a1).unwrap().unwrap();
+        assert!(starred.read && starred.starred);
+        db.set_starred(anna, a1, false).unwrap();
+        db.set_read(chris, a1, false).unwrap();
 
         // Filters work per user.
         let unread_a = ItemQuery {
@@ -2041,9 +2064,11 @@ mod bench {
         db.upsert_items("https://f0.example/", 0, &changed).unwrap();
         println!("re-store it with 5 of 500 items changed: {:?}", t.elapsed());
         let u = db.user("u1").unwrap().unwrap().id;
+        let t = Instant::now();
         for i in 0..20_000 {
             db.set_read(u, i * 5 + 1, true).unwrap();
         }
+        println!("set_read 20k items: {:?}", t.elapsed());
         let time = |name: &str, f: &mut dyn FnMut()| {
             f();
             let t = Instant::now();

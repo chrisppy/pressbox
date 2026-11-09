@@ -71,28 +71,59 @@ pub fn base_url(item_url: Option<&str>, feed_url: &str) -> String {
 /// Cleans HTML from a feed. `base` resolves relative links and images.
 pub fn html(dirty: &str, base: Option<&str>) -> String {
     let without_pixels = PIXEL.replace_all(dirty, "");
-    builder(base)
-        .clean(&without_pixels)
-        .to_string()
-        .trim()
-        .to_owned()
+    let mut clean = builder(base).clean(&without_pixels).to_string();
+    // Trimmed in place: item HTML can be large, so don't copy it again.
+    clean.truncate(clean.trim_end().len());
+    clean.drain(..clean.len() - clean.trim_start().len());
+    clean
 }
 
-/// Any tag. Only used on HTML already cleaned by [`html`], so a plain
-/// pattern is enough and much cheaper than parsing it again.
-static TAG: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<[^>]*>").expect("valid regex"));
+/// The entities ammonia writes, and what they stand for. `&amp;` comes
+/// last only for readability: each `&` is decoded once, left to right, so
+/// `&amp;lt;` stays `&lt;`.
+const ENTITIES: [(&str, char); 6] = [
+    ("&lt;", '<'),
+    ("&gt;", '>'),
+    ("&quot;", '"'),
+    ("&#39;", '\''),
+    ("&nbsp;", ' '),
+    ("&amp;", '&'),
+];
 
-/// Plain text of an HTML fragment, for the search index.
+/// Plain text of an HTML fragment, for the search index: tags become
+/// spaces, the entities above are decoded, and runs of whitespace become
+/// one space. Only used on HTML already cleaned by [`html`], so skipping
+/// from `<` to `>` is enough and much cheaper than parsing it again. One
+/// pass, as this runs for every item stored.
 pub fn text(html: &str) -> String {
-    let stripped = TAG.replace_all(html, " ");
-    let decoded = stripped
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&");
-    decoded.split_whitespace().collect::<Vec<_>>().join(" ")
+    let mut out = String::with_capacity(html.len());
+    // Whitespace (or a tag) seen since the last character written.
+    let mut gap = false;
+    let mut rest = html;
+    while let Some(c) = rest.chars().next() {
+        let (c, len) = match c {
+            '<' => match rest.find('>') {
+                Some(end) => (' ', end + 1),
+                None => ('<', 1),
+            },
+            '&' => ENTITIES
+                .iter()
+                .find(|(entity, _)| rest.starts_with(entity))
+                .map_or(('&', 1), |&(entity, c)| (c, entity.len())),
+            c => (c, c.len_utf8()),
+        };
+        rest = &rest[len..];
+        if c.is_whitespace() {
+            gap = true;
+        } else {
+            if gap && !out.is_empty() {
+                out.push(' ');
+            }
+            gap = false;
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -166,5 +197,51 @@ mod tests {
             text("<p>Rust &amp; <b>Nix</b></p>\n<p>tips&nbsp;here</p>"),
             "Rust & Nix tips here"
         );
+    }
+
+    /// The regex-and-replace version `text` replaced, kept to check the
+    /// one-pass version against.
+    fn text_reference(html: &str) -> String {
+        let stripped = Regex::new(r"<[^>]*>").unwrap().replace_all(html, " ");
+        stripped
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn text_matches_the_reference() {
+        for case in [
+            "",
+            "   ",
+            "plain",
+            "<p></p>",
+            "a<br>b",
+            "a <br> b",
+            "  <p>  lead and trail  </p>  ",
+            "&amp;lt; stays escaped once",
+            "&amp;nbsp;",
+            "&&lt;&",
+            "& alone, &unknown; and &#40;",
+            "1 < 2 but no closing bracket",
+            "<a href=\"x\">link</a>&quot;q&quot; &#39;s&#39;",
+            "tabs\tand\nnewlines\r\n",
+            "non\u{a0}breaking and café 日本語 <i>emoji 🦀</i>",
+            "<p>multi\nline\ntag</p",
+        ] {
+            assert_eq!(text(case), text_reference(case), "{case:?}");
+        }
+    }
+
+    #[test]
+    fn html_is_trimmed() {
+        assert_eq!(html("  \n<p>x</p>\n  ", None), "<p>x</p>");
+        assert_eq!(html("   ", None), "");
     }
 }

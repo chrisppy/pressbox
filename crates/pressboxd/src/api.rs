@@ -205,7 +205,7 @@ async fn item(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<Item>> {
     state
-        .write(move |db| db.item(user.id, id))
+        .read(move |db| db.item(user.id, id))
         .await?
         .map(Json)
         .ok_or(ApiError::NotFound)
@@ -336,21 +336,25 @@ async fn approve(
                 ));
             }
             state
-                .db()
-                .user(&name)?
+                .read(move |db| db.user(&name))
+                .await?
                 .ok_or(ApiError::BadRequest("no such user"))?
         }
         _ => approver,
     };
-    approve_for(&state, &code, &target)
+    approve_for(&state, code, target).await
 }
 
 /// Approves a pairing code for `user` (shared with the control socket).
-pub fn approve_for(state: &AppState, code: &str, user: &AuthUser) -> ApiResult<Json<Approved>> {
-    let db = state.db();
+pub async fn approve_for(
+    state: &Arc<AppState>,
+    code: String,
+    user: AuthUser,
+) -> ApiResult<Json<Approved>> {
+    let pairings = state.clone();
     let approved = state
-        .pairings
-        .approve(code, &db, user, now())?
+        .write(move |db| pairings.pairings.approve(&code, db, &user, now()))
+        .await?
         .ok_or(ApiError::NotFound)?;
     tracing::info!("paired device {:?} for {}", approved.name, approved.user);
     Ok(Json(approved))

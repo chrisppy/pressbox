@@ -405,41 +405,41 @@ async fn poll(http: &reqwest::Client, target: &FetchTarget, now: i64) -> Result<
     }
     let resp = req.send().await?;
     let status = resp.status();
-    let headers = resp.headers().clone();
+    let headers = resp.headers();
+    let max_age = max_age(headers);
     if status == StatusCode::NOT_MODIFIED {
-        return Ok(Polled::NotModified {
-            max_age: max_age(&headers),
-        });
+        return Ok(Polled::NotModified { max_age });
     }
     if !status.is_success() {
+        let throttled = matches!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
+        );
         return Err(PollError {
             message: format!("HTTP {status}"),
-            retry_after: matches!(
-                status,
-                StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE
-            )
-            .then(|| retry_after(&headers, now))
-            .flatten(),
+            retry_after: throttled.then(|| retry_after(headers, now)).flatten(),
         });
     }
+    // Taken before the body is read, which consumes the response.
     let header = |name| {
         headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned)
     };
+    let (etag, last_modified) = (header(ETAG), header(LAST_MODIFIED));
     let body = read_limited(resp, MAX_BODY, "feed").await?;
     // Parsing a large feed takes a while; keep it off the runtime threads.
     let uri = target.url.clone();
     let (mut result, items) = tokio::task::spawn_blocking(move || parse_raw(&body, Some(&uri)))
         .await?
         .map_err(|e| format!("{e:#}"))?;
-    result.etag = header(ETAG);
-    result.last_modified = header(LAST_MODIFIED);
+    result.etag = etag;
+    result.last_modified = last_modified;
     Ok(Polled::Fresh {
         result,
         items,
-        max_age: max_age(&headers),
+        max_age,
     })
 }
 
@@ -512,10 +512,7 @@ pub fn parse_raw(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<Raw
         .entries
         .into_iter()
         .map(|e| {
-            let url = e
-                .links
-                .iter()
-                .find(|l| l.rel.as_deref().is_none_or(|r| r == "alternate"))
+            let url = alternate(&e.links)
                 .or_else(|| e.links.first())
                 .map(|l| l.href.clone());
             RawItem {
@@ -532,14 +529,17 @@ pub fn parse_raw(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<Raw
         .collect();
     let result = FetchResult {
         title: feed.title.map(|t| sanitize::text(&t.content)),
-        site_url: feed
-            .links
-            .iter()
-            .find(|l| l.rel.as_deref().is_none_or(|r| r == "alternate"))
-            .map(|l| l.href.clone()),
+        site_url: alternate(&feed.links).map(|l| l.href.clone()),
         ..Default::default()
     };
     Ok((result, items))
+}
+
+/// The link to the page itself: `rel="alternate"`, or no `rel` at all.
+fn alternate(links: &[feed_rs::model::Link]) -> Option<&feed_rs::model::Link> {
+    links
+        .iter()
+        .find(|l| l.rel.as_deref().is_none_or(|r| r == "alternate"))
 }
 
 #[cfg(test)]
@@ -804,6 +804,204 @@ mod tests {
             get(1000).await.unwrap_err(),
             "body is larger than 5000 bytes"
         );
+    }
+
+    /// A local feed server for the polling tests:
+    /// - `/feed`: RSS with ETag `"v1"`, or 304 with `max-age=7200` when
+    ///   asked with that ETag. Its items link to `/post`, `/missing` and
+    ///   `/json`.
+    /// - `/down`: 503 with `Retry-After: 5000`.
+    /// - `/garbage`: 200, but not a feed.
+    /// - `/post`: an article page; `/json`: not HTML; `/missing`: 404.
+    async fn feed_server() -> std::net::SocketAddr {
+        use axum::{
+            Router,
+            http::{HeaderMap as Headers, StatusCode as Code, header},
+            response::IntoResponse,
+            routing::get,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rss = format!(
+            r#"<?xml version="1.0"?><rss version="2.0"><channel><title>Local</title>
+              <link>http://{addr}/</link>
+              <item><title>Post</title><guid>p</guid><link>http://{addr}/post</link>
+                <description>short</description>
+                <pubDate>Tue, 03 Nov 2026 10:00:00 GMT</pubDate></item>
+              <item><title>Gone</title><guid>m</guid><link>http://{addr}/missing</link></item>
+              <item><title>Data</title><guid>j</guid><link>http://{addr}/json</link></item>
+            </channel></rss>"#
+        );
+        let story = "Polling feeds is a patient business, one request at a time. ".repeat(10);
+        let page = format!(
+            "<html><body><article><h1>Post</h1><p>{story}</p><p>{story}</p></article></body></html>"
+        );
+        let app = Router::new()
+            .route(
+                "/feed",
+                get(move |headers: Headers| async move {
+                    if headers
+                        .get(header::IF_NONE_MATCH)
+                        .is_some_and(|v| v == "\"v1\"")
+                    {
+                        (
+                            Code::NOT_MODIFIED,
+                            [(header::CACHE_CONTROL, "max-age=7200")],
+                        )
+                            .into_response()
+                    } else {
+                        ([(header::ETAG, "\"v1\"")], rss).into_response()
+                    }
+                }),
+            )
+            .route(
+                "/down",
+                get(|| async { (Code::SERVICE_UNAVAILABLE, [(header::RETRY_AFTER, "5000")]) }),
+            )
+            .route("/garbage", get(|| async { "<html>not a feed</html>" }))
+            .route(
+                "/post",
+                get(move || async move { ([(header::CONTENT_TYPE, "text/html")], page) }),
+            )
+            .route(
+                "/json",
+                get(|| async { ([(header::CONTENT_TYPE, "application/json")], "{}") }),
+            )
+            .route("/missing", get(|| async { Code::NOT_FOUND }));
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        addr
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn polls_schedules_and_fetches_articles() {
+        use pressbox_api::ItemQuery;
+        let addr = feed_server().await;
+        let config = format!(
+            r#"
+            [feeds.ok]
+            url = "http://{addr}/feed"
+            full_text = true
+            [feeds.down]
+            url = "http://{addr}/down"
+            [feeds.garbage]
+            url = "http://{addr}/garbage"
+            "#
+        );
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        db.sync(&crate::config::Config::parse(&config).unwrap())
+            .unwrap();
+        let user = db.only_user().unwrap().unwrap().id;
+        let mut state = AppState::new(db, None, 100).unwrap();
+        state.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let state = Arc::new(state);
+        let target = |path: &str| {
+            let url = format!("http://{addr}/{path}");
+            state
+                .reader()
+                .due_targets(i64::MAX, 1800)
+                .unwrap()
+                .into_iter()
+                .find(|t| t.url == url)
+                .unwrap()
+        };
+
+        // First pass: the feed is stored, the others fail.
+        let before = now();
+        let stats = run_due(state.clone(), 1800).await.unwrap();
+        assert_eq!(
+            stats,
+            RefreshStats {
+                fetched: 3,
+                failed: 2,
+                new_items: 3
+            }
+        );
+        assert_eq!(run_due(state.clone(), 1800).await, None, "nothing due");
+        let ok = target("feed");
+        assert_eq!((ok.etag.as_deref(), ok.fail_count), (Some("\"v1\""), 0));
+        assert!(ok.full_text);
+        let down = target("down");
+        assert_eq!(down.fail_count, 1);
+        let feeds = state.reader().feeds(user).unwrap();
+        let error = |id: &str| {
+            feeds
+                .iter()
+                .find(|f| f.id == id)
+                .unwrap()
+                .last_error
+                .clone()
+        };
+        assert_eq!(
+            error("down").as_deref(),
+            Some("HTTP 503 Service Unavailable")
+        );
+        assert!(error("garbage").is_some());
+        assert_eq!(error("ok"), None);
+        assert_eq!(
+            feeds.iter().find(|f| f.id == "ok").unwrap().site_url,
+            Some(format!("http://{addr}/"))
+        );
+        // The interval (1800s) for the others; Retry-After (5000s) wins for
+        // the 503.
+        let next = state.reader().next_due().unwrap().unwrap();
+        assert!((before + 1800..=now() + 1800).contains(&next), "{next}");
+        let due_by = |at: i64| -> Vec<String> {
+            let targets = state.reader().due_targets(at, 1800).unwrap();
+            targets.into_iter().map(|t| t.url).collect()
+        };
+        assert!(!due_by(before + 4999).contains(&down.url));
+        assert!(due_by(now() + 5000).contains(&down.url));
+
+        // Articles are fetched in the background: the page's text replaces
+        // the feed's; failures are recorded so they aren't tried again.
+        let pending = || state.reader().full_text_pending(&ok.url, 10).unwrap();
+        for _ in 0..100 {
+            if pending().is_empty() && state.articles_running.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(pending().is_empty());
+        let items = state.reader().items(user, &ItemQuery::default()).unwrap();
+        let content = |title: &str| {
+            let id = items.items.iter().find(|i| i.title == title).unwrap().id;
+            state.reader().item(user, id).unwrap().unwrap().content
+        };
+        assert!(
+            content("Post").unwrap().contains("patient business"),
+            "article stored"
+        );
+        assert_eq!(content("Gone"), None, "feed text kept when the page 404s");
+        assert_eq!(content("Data"), None, "and when it isn't HTML");
+        let search = ItemQuery {
+            q: Some("patient".into()),
+            ..ItemQuery::default()
+        };
+        assert_eq!(
+            state.reader().items(user, &search).unwrap().items.len(),
+            1,
+            "the article is searchable"
+        );
+
+        // Second pass: 304 keeps the ETag and honours max-age; the 503
+        // backs off again.
+        state.request_refresh().await;
+        let stats = run_due(state.clone(), 1800).await.unwrap();
+        assert_eq!((stats.fetched, stats.failed, stats.new_items), (3, 2, 0));
+        let ok = target("feed");
+        assert_eq!((ok.etag.as_deref(), ok.fail_count), (Some("\"v1\""), 0));
+        assert_eq!(target("down").fail_count, 2);
+        let due: Vec<_> = state.reader().due_targets(now() + 7199, 1800).unwrap();
+        assert!(!due.iter().any(|t| t.url == ok.url), "max-age=7200 waits");
+    }
+
+    #[test]
+    fn untitled_entries_fall_back() {
+        let rss = br#"<?xml version="1.0"?><rss version="2.0"><channel><title>T</title>
+              <item><guid>a</guid><title>  </title></item>
+            </channel></rss>"#;
+        let (_, items) = parse(rss, None).unwrap();
+        assert_eq!(items[0].title, "(untitled)");
     }
 
     #[test]

@@ -17,7 +17,7 @@ use anyhow::Result;
 use pressbox_api::{Approved, NewDevice, PairApproved, PairStart, PendingPairing};
 use sha2::{Digest, Sha256};
 
-use crate::db::{AuthUser, Db};
+use crate::db::{AuthUser, Db, hex};
 
 /// How long a pairing request stays valid.
 pub const TTL: i64 = 10 * 60;
@@ -33,14 +33,6 @@ fn random_bytes<const N: usize>() -> [u8; N] {
     let mut bytes = [0; N];
     getrandom::fill(&mut bytes).expect("the OS random number generator failed");
     bytes
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes.iter().fold(String::new(), |mut s, b| {
-        let _ = write!(s, "{b:02x}");
-        s
-    })
 }
 
 /// A new random API token.
