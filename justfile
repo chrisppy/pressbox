@@ -23,6 +23,11 @@ test:
 lint:
     {{ cargo }} clippy --workspace --all-targets -- -D warnings
 
+# Line coverage per file (Linux). Built in target/tarpaulin so normal builds
+# stay cached; `just coverage --out Html` also writes target/coverage/tarpaulin-report.html
+coverage *args:
+    {{ cargo }} tarpaulin --workspace --engine ptrace --target-dir target/tarpaulin --output-dir target/coverage {{ args }}
+
 # Check advisories, licenses, duplicate crates and sources
 deny:
     {{ cargo }} deny check

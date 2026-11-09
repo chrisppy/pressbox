@@ -113,8 +113,9 @@ there; that is why the NixOS and Home Manager modules live in `modules/`.
 ## Development
 
 ```sh
-nix develop          # Rust toolchain, treefmt, just, cargo-deny (optional:
-                     # outside it, the recipes run Cargo through nix develop)
+nix develop          # Rust toolchain, treefmt, just, cargo-deny, cargo-tarpaulin
+                     # (optional: outside it, the recipes run Cargo through
+                     # nix develop)
 just                 # list the recipes
 just test            # cargo test
 just lint            # clippy, warnings as errors
@@ -122,6 +123,7 @@ just fmt             # devfmt's treefmt setup
 just deny            # advisories, licenses, duplicate crates, sources
 just check           # nix flake check: builds, module checks, NixOS VM test
 just verify          # all of the above, as CI does
+just coverage        # line coverage per file (cargo-tarpaulin, Linux)
 ```
 
 `cargo deny` also runs in CI on every push and weekly, so a new advisory against
