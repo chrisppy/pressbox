@@ -5,7 +5,7 @@
 //! tested without a terminal.
 
 use anyhow::Result;
-use pressbox_api::{Feed, Item, ItemPage, ItemQuery};
+use pressbox_api::{Feed, Item, ItemPage, ItemQuery, MarkRead};
 use ratatui::crossterm::event::KeyCode;
 
 use crate::client::Client;
@@ -20,6 +20,7 @@ pub trait Backend {
     fn set_read(&self, id: i64, value: bool) -> Result<()>;
     fn set_starred(&self, id: i64, value: bool) -> Result<()>;
     fn mark_feed_read(&self, feed: &str) -> Result<u32>;
+    fn mark_read(&self, request: &MarkRead) -> Result<u32>;
     fn refresh(&self) -> Result<()>;
 }
 
@@ -42,6 +43,9 @@ impl Backend for Client {
     fn mark_feed_read(&self, feed: &str) -> Result<u32> {
         Client::mark_feed_read(self, feed)
     }
+    fn mark_read(&self, request: &MarkRead) -> Result<u32> {
+        Client::mark_read(self, request)
+    }
     fn refresh(&self) -> Result<()> {
         Client::refresh(self)
     }
@@ -58,6 +62,43 @@ pub enum Pane {
 pub const ALL_ROW: usize = 0;
 pub const STARRED_ROW: usize = 1;
 pub const FIXED_ROWS: usize = 2;
+
+/// Which items the list shows, by read state. Starred lists and searches
+/// show both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Show {
+    Unread,
+    All,
+    Read,
+}
+
+impl Show {
+    /// The next in the cycle `u` steps through.
+    fn next(self) -> Self {
+        match self {
+            Self::Unread => Self::All,
+            Self::All => Self::Read,
+            Self::Read => Self::Unread,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unread => "unread",
+            Self::All => "all",
+            Self::Read => "read",
+        }
+    }
+
+    /// The `unread` query parameter: `false` asks for read items only.
+    fn unread(self) -> Option<bool> {
+        match self {
+            Self::Unread => Some(true),
+            Self::All => None,
+            Self::Read => Some(false),
+        }
+    }
+}
 
 pub struct Reader {
     pub item: Item,
@@ -79,7 +120,7 @@ pub struct App {
     pub next_page: Option<NextPage>,
     pub reader: Option<Reader>,
     pub focus: Pane,
-    pub unread_only: bool,
+    pub show: Show,
     pub status: String,
     /// The active search, if any. Searches ignore the unread filter.
     pub search: Option<String>,
@@ -114,7 +155,7 @@ impl App {
             next_page: None,
             reader: None,
             focus: Pane::Feeds,
-            unread_only: true,
+            show: Show::Unread,
             status: String::new(),
             search: None,
             editing: None,
@@ -138,12 +179,17 @@ impl App {
             .and_then(|i| self.feeds.get(i))
     }
 
+    /// Whether `show` applies: starred lists and searches ignore it.
+    pub fn filters_by_read(&self) -> bool {
+        self.feed_row != STARRED_ROW && self.search.is_none()
+    }
+
     fn query(&self, from: Option<&NextPage>) -> ItemQuery {
         let starred = self.feed_row == STARRED_ROW;
         ItemQuery {
             feed: self.selected_feed().map(|f| f.id.clone()),
             starred: starred.then_some(true),
-            unread: (self.unread_only && !starred && self.search.is_none()).then_some(true),
+            unread: self.filters_by_read().then(|| self.show.unread()).flatten(),
             q: self.search.clone(),
             limit: Some(PAGE),
             cursor: match from {
@@ -258,15 +304,12 @@ impl App {
                     }
                 }
                 KeyCode::Char('A') => self.mark_feed_read(backend)?,
+                KeyCode::Char('M') => self.mark_below_read(backend)?,
                 KeyCode::Char('u') => {
-                    self.unread_only = !self.unread_only;
+                    self.show = self.show.next();
                     self.item_row = 0;
                     self.load_items(backend)?;
-                    self.status = if self.unread_only {
-                        "showing unread items".into()
-                    } else {
-                        "showing all items".into()
-                    };
+                    self.status = format!("showing {} items", self.show.label());
                 }
                 KeyCode::Char('r') => {
                     self.reload(backend);
@@ -403,6 +446,37 @@ impl App {
         if let Some(r) = self.reader.as_mut().filter(|r| r.item.id == id) {
             f(&mut r.item);
         }
+    }
+
+    /// Marks the selected item and every item below it in the list read,
+    /// including pages not loaded yet, in one request.
+    fn mark_below_read(&mut self, backend: &impl Backend) -> Result<()> {
+        if self.focus == Pane::Feeds {
+            return Ok(());
+        }
+        let Some(from) = self.items.get(self.item_row).map(|i| i.id) else {
+            return Ok(());
+        };
+        let marked = backend.mark_read(&MarkRead {
+            query: ItemQuery {
+                limit: None,
+                ..self.query(None)
+            },
+            from: Some(from),
+        })?;
+        // Left in the list, as `m` leaves them, until the next reload.
+        for item in &mut self.items[self.item_row..] {
+            item.read = true;
+        }
+        if let Some(r) = self.reader.as_mut() {
+            r.item.read |= self.items[self.item_row..]
+                .iter()
+                .any(|i| i.id == r.item.id);
+        }
+        self.feeds = backend.feeds()?;
+        let s = if marked == 1 { "" } else { "s" };
+        self.status = format!("marked {marked} item{s} read");
+        Ok(())
     }
 
     fn mark_feed_read(&mut self, backend: &impl Backend) -> Result<()> {
@@ -546,6 +620,34 @@ mod tests {
             }
             Ok(n)
         }
+        fn mark_read(&self, request: &MarkRead) -> Result<u32> {
+            self.calls
+                .borrow_mut()
+                .push(format!("mark-read from {:?}", request.from));
+            let listed: Vec<i64> = self
+                .items(&request.query)?
+                .items
+                .iter()
+                .map(|i| i.id)
+                .collect();
+            let start = request
+                .from
+                .map_or(Some(0), |from| listed.iter().position(|&id| id == from));
+            let Some(start) = start else { return Ok(0) };
+            let mut n = 0;
+            for id in &listed[start..] {
+                if let Some(i) = self
+                    .items
+                    .borrow_mut()
+                    .iter_mut()
+                    .find(|i| i.id == *id && !i.read)
+                {
+                    i.read = true;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        }
         fn refresh(&self) -> Result<()> {
             self.calls.borrow_mut().push("refresh".into());
             Ok(())
@@ -628,6 +730,43 @@ mod tests {
             app.handle(KeyCode::Char('q'), &fake),
             Action::Quit
         ));
+    }
+
+    #[test]
+    fn marks_below_read_and_shows_read_items() {
+        let fake = Fake::new();
+        let mut app = App::new();
+        app.reload(&fake);
+        keys(&mut app, &fake, "M");
+        assert!(
+            fake.calls.borrow().is_empty(),
+            "nothing selected in the feed list"
+        );
+
+        // From item 2 down (2 and 3), not item 1 above it.
+        keys(&mut app, &fake, "\njM");
+        assert_eq!(*fake.calls.borrow(), ["mark-read from Some(2)"]);
+        assert_eq!(app.status, "marked 2 items read");
+        let read: Vec<bool> = app.items.iter().map(|i| i.read).collect();
+        assert_eq!(read, [false, true, true], "kept in the list until reload");
+        assert_eq!(app.total_unread(), 1);
+
+        // u cycles unread -> all -> read -> unread.
+        keys(&mut app, &fake, "u");
+        assert_eq!((app.show, app.items.len()), (Show::All, 3));
+        assert_eq!(app.status, "showing all items");
+        keys(&mut app, &fake, "u");
+        assert_eq!(app.show, Show::Read);
+        assert_eq!(app.items.iter().map(|i| i.id).collect::<Vec<_>>(), [2, 3]);
+        keys(&mut app, &fake, "u");
+        assert_eq!((app.show, app.items.len()), (Show::Unread, 1));
+
+        // Starred lists ignore it.
+        keys(&mut app, &fake, "uu");
+        fake.set_starred(1, true).unwrap();
+        keys(&mut app, &fake, "hj");
+        assert_eq!(app.feed_row, STARRED_ROW);
+        assert_eq!(app.items.len(), 1, "unread starred item shows in read view");
     }
 
     #[test]

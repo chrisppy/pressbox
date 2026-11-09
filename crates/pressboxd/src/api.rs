@@ -14,6 +14,7 @@
 //! | PUT    | /api/v1/items/{id}/read          | `Flag`           | 204                |
 //! | PUT    | /api/v1/items/{id}/starred       | `Flag`           | 204                |
 //! | POST   | /api/v1/feeds/{id}/read-all      |                  | `Updated`          |
+//! | POST   | /api/v1/items/read-all           | `MarkRead`       | `Updated`          |
 //! | POST   | /api/v1/refresh                  |                  | 202                |
 //! | GET    | /api/v1/me                       |                  | `Me`               |
 //! | GET    | /api/v1/pairings                 |                  | `[PendingPairing]` |
@@ -37,8 +38,8 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use pressbox_api::{
-    ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, Me, PairRequest, PairStart,
-    PendingPairing, Updated, Version,
+    ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, MarkRead, Me, PairRequest,
+    PairStart, PendingPairing, Updated, Version,
 };
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
@@ -55,6 +56,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/feeds", get(feeds))
         .route("/feeds/{id}/read-all", post(read_all))
         .route("/items", get(items))
+        .route("/items/read-all", post(mark_read))
         .route("/items/{id}", get(item))
         .route("/items/{id}/read", put(set_read))
         .route("/items/{id}/starred", put(set_starred))
@@ -254,6 +256,18 @@ async fn read_all(
         .write(move |db| db.mark_feed_read(user.id, &id))
         .await?
         .ok_or(ApiError::NotFound)?;
+    Ok(Json(Updated { updated }))
+}
+
+/// Marks what a list shows read, or from one item down.
+async fn mark_read(
+    State(state): State<Arc<AppState>>,
+    Extension(user): User,
+    Json(req): Json<MarkRead>,
+) -> ApiResult<Json<Updated>> {
+    let updated = state
+        .write(move |db| db.mark_read(user.id, &req.query, req.from))
+        .await?;
     Ok(Json(Updated { updated }))
 }
 
@@ -484,6 +498,31 @@ mod tests {
         );
         let (status, _) = call(&s, "POST", "/api/v1/refresh", None, T).await;
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
+    async fn marks_lists_read() {
+        let s = state();
+        let (status, body) = call(&s, "POST", "/api/v1/items/read-all", Some("{}"), T).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, r#"{"updated":1}"#)
+        );
+        let (_, body) = call(&s, "GET", "/api/v1/items?unread=true", None, T).await;
+        assert!(
+            serde_json::from_str::<ItemPage>(&body)
+                .unwrap()
+                .items
+                .is_empty()
+        );
+        let filtered = Some(r#"{"feed":"a","unread":true,"from":1}"#);
+        let (status, body) = call(&s, "POST", "/api/v1/items/read-all", filtered, T).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (StatusCode::OK, r#"{"updated":0}"#)
+        );
+        let (status, _) = call(&s, "POST", "/api/v1/items/read-all", Some("{}"), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -14,7 +14,7 @@ use ratatui::{
 
 use crate::app::{ALL_ROW, App, FIXED_ROWS, Pane, STARRED_ROW};
 
-const HELP: &str = "j/k move  enter open  / search  m read  s star  o browser  A all read  u unread/all  r reload  R refresh  q quit";
+const HELP: &str = "j/k move  enter open  / search  m read  M read below  s star  o browser  A all read  u unread/all/read  r reload  R refresh  q quit";
 
 pub fn draw(frame: &mut Frame, app: &App) {
     let [body, status] =
@@ -131,8 +131,8 @@ fn draw_items(frame: &mut Frame, app: &App, area: Rect) {
     let title = if let Some(q) = &app.search {
         format!(" Search {q:?}: {}{more} (esc clears) ", app.items.len())
     } else {
-        let what = if app.unread_only && app.feed_row != STARRED_ROW {
-            "unread"
+        let what = if app.filters_by_read() {
+            app.show.label()
         } else {
             "all"
         };

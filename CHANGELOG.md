@@ -29,6 +29,8 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
 - Entries unchanged since the last fetch are no longer re-sanitized (a new
   database column records each one's digest as sent), and per-feed pruning only
   runs when something was added or `maxAgeDays` is set.
+- `POST /api/v1/items/read-all` marks a whole list read in one request (any
+  filters, search included), or only from a given item down.
 
 ### Desktop client
 
@@ -43,7 +45,11 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
 ### Terminal client
 
 - Pages by cursor, falling back to offsets with an older server; asks for gzip
-  responses.
+  responses. Loading more items no longer repeats the first page.
+- `M` marks the selected item and every item below it read, including ones not
+  loaded yet.
+- `u` cycles unread, all and read items, so read posts can be listed on their
+  own.
 
 ## [0.1.0] - 2026-11-07
 

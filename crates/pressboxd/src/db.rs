@@ -816,43 +816,11 @@ impl Db {
     pub fn items(&self, user: i64, query: &ItemQuery) -> Result<ItemPage> {
         let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = query.offset.unwrap_or(0);
-        let mut clauses = vec![VISIBLE];
-        let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(user)];
-        if let Some(feed) = &query.feed {
-            clauses.push("s.feed_id = ?");
-            args.push(Box::new(feed.clone()));
-        }
-        if let Some(tag) = &query.tag {
-            clauses.push("EXISTS (SELECT 1 FROM json_each(s.tags) WHERE value = ?)");
-            args.push(Box::new(tag.clone()));
-        }
-        if let Some(unread) = query.unread {
-            clauses.push("COALESCE(st.read, 0) = ?");
-            args.push(Box::new(!unread));
-        }
-        match query.starred {
-            // Start from the user's stars instead of scanning every item.
-            Some(true) => clauses.push(
-                "i.id IN (SELECT item_id FROM item_state WHERE user_id = ?1 AND starred = 1)",
-            ),
-            Some(false) => clauses.push("COALESCE(st.starred, 0) = 0"),
-            None => {}
-        }
-        let mut index = "";
-        if let Some(fts) = query.q.as_deref().and_then(fts_query) {
-            if query.feed.is_none() && query.starred != Some(true) {
-                // Walk items newest first and stop after a page, checking
-                // each against the matches, rather than sorting every match:
-                // a common word matches most items (300ms -> 16ms on 100k
-                // items), and no match at all costs one index scan (~5ms).
-                // A feed or starred filter has a narrower index to start from.
-                index = "INDEXED BY items_by_date";
-                clauses.push("+i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
-            } else {
-                clauses.push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
-            }
-            args.push(Box::new(fts));
-        }
+        let Filters {
+            mut clauses,
+            mut args,
+            index,
+        } = Filters::new(user, query, true);
         // A cursor continues from where the last page ended, walking the
         // index from there instead of counting past every earlier item.
         let cursor = query.cursor.as_deref().map(parse_cursor).transpose()?;
@@ -886,6 +854,40 @@ impl Db {
             next_cursor,
             next_offset,
         })
+    }
+
+    /// Marks read every unread item a list shows (its filters, not its
+    /// paging), or, given `from`, that item and the ones after it in the
+    /// list. Returns how many were unread; 0 if the user can't see `from`.
+    pub fn mark_read(&self, user: i64, query: &ItemQuery, from: Option<i64>) -> Result<u32> {
+        let Filters {
+            mut clauses,
+            mut args,
+            index,
+        } = Filters::new(user, query, false);
+        if let Some(from) = from {
+            let Some(published) = self.item(user, from)?.map(|i| i.published) else {
+                return Ok(0);
+            };
+            // The list is newest first: "after" is older, or as old with a
+            // lower id.
+            clauses.push("(i.published, i.id) <= (?, ?)");
+            args.push(Box::new(published));
+            args.push(Box::new(from));
+        }
+        // Touches only the unread items, so the rows changed are the count.
+        clauses.push("COALESCE(st.read, 0) = 0");
+        let marked = self.conn.execute(
+            &format!(
+                "INSERT INTO item_state (user_id, item_id, read)
+                 SELECT ?1, i.id, 1 FROM items i {index} {USER_JOINS}
+                 WHERE {}
+                 ON CONFLICT (user_id, item_id) DO UPDATE SET read = 1",
+                clauses.join(" AND ")
+            ),
+            params_from_iter(args.iter()),
+        )?;
+        Ok(u32::try_from(marked)?)
     }
 
     /// One item with its content, if the user may see it.
@@ -1213,6 +1215,65 @@ fn fts_query(input: &str) -> Option<String> {
     (!words.is_empty()).then(|| words.join(" "))
 }
 
+/// SQL conditions for an item query's filters (not its paging), joined
+/// with `AND` after `items i {index} {USER_JOINS}`. `args` starts with the
+/// user's id, for `?1`; the rest follow the clauses' `?`s in order.
+struct Filters {
+    clauses: Vec<&'static str>,
+    args: Vec<Box<dyn ToSql>>,
+    /// An index hint for `items i`, or "".
+    index: &'static str,
+}
+
+impl Filters {
+    /// `paged`: the query reads one page, newest first, rather than every
+    /// match, which changes the best plan for a search.
+    fn new(user: i64, query: &ItemQuery, paged: bool) -> Self {
+        let mut clauses = vec![VISIBLE];
+        let mut args: Vec<Box<dyn ToSql>> = vec![Box::new(user)];
+        let mut index = "";
+        if let Some(feed) = &query.feed {
+            clauses.push("s.feed_id = ?");
+            args.push(Box::new(feed.clone()));
+        }
+        if let Some(tag) = &query.tag {
+            clauses.push("EXISTS (SELECT 1 FROM json_each(s.tags) WHERE value = ?)");
+            args.push(Box::new(tag.clone()));
+        }
+        if let Some(unread) = query.unread {
+            clauses.push("COALESCE(st.read, 0) = ?");
+            args.push(Box::new(!unread));
+        }
+        match query.starred {
+            // Start from the user's stars instead of scanning every item.
+            Some(true) => clauses.push(
+                "i.id IN (SELECT item_id FROM item_state WHERE user_id = ?1 AND starred = 1)",
+            ),
+            Some(false) => clauses.push("COALESCE(st.starred, 0) = 0"),
+            None => {}
+        }
+        if let Some(fts) = query.q.as_deref().and_then(fts_query) {
+            if paged && query.feed.is_none() && query.starred != Some(true) {
+                // Walk items newest first and stop after a page, checking
+                // each against the matches, rather than sorting every match:
+                // a common word matches most items (300ms -> 16ms on 100k
+                // items), and no match at all costs one index scan (~5ms).
+                // A feed or starred filter has a narrower index to start from.
+                index = "INDEXED BY items_by_date";
+                clauses.push("+i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
+            } else {
+                clauses.push("i.id IN (SELECT rowid FROM items_fts WHERE items_fts MATCH ?)");
+            }
+            args.push(Box::new(fts));
+        }
+        Self {
+            clauses,
+            args,
+            index,
+        }
+    }
+}
+
 /// Item columns as one user sees them, from `items i` with [`USER_JOINS`].
 const ITEM_COLUMNS: &str =
     "i.id, COALESCE(s.feed_id, i.source), i.title, i.url, i.author, i.summary,
@@ -1390,6 +1451,73 @@ mod tests {
                 .unwrap_err();
             assert!(err.is::<BadCursor>(), "{bad:?}: {err:#}");
         }
+    }
+
+    #[test]
+    fn marks_a_list_read_from_an_item_down() {
+        let (mut db, chris, anna) = two_users();
+        // a1..a5, newest first is a5; a2 and a3 share a time, so the id
+        // decides their order.
+        let items: Vec<_> = [1, 2, 2, 4, 5]
+            .iter()
+            .enumerate()
+            .map(|(n, &t)| item(&format!("a{}", n + 1), Some(t)))
+            .collect();
+        db.upsert_items(A, 0, &items).unwrap();
+        db.upsert_items(B, 0, &[item("b1", Some(3))]).unwrap();
+        db.upsert_items(C, 0, &[item("c1", Some(9))]).unwrap();
+        let list = |user, query: &ItemQuery| -> Vec<String> {
+            titles(&db.items(user, query).unwrap())
+                .into_iter()
+                .map(|t| t.trim_start_matches("title ").to_owned())
+                .collect()
+        };
+        let feed_a = ItemQuery {
+            feed: Some("a".into()),
+            ..q()
+        };
+        assert_eq!(list(chris, &feed_a), ["a5", "a4", "a3", "a2", "a1"]);
+        let id = |title: &str| {
+            let page = db.items(chris, &q()).unwrap();
+            page.items
+                .iter()
+                .find(|i| i.title == format!("title {title}"))
+                .unwrap()
+                .id
+        };
+
+        // From a3 down, in feed a only: a3 and the older a2 (same time,
+        // lower id) and a1. Already-read items don't count.
+        db.set_read(chris, id("a1"), true).unwrap();
+        assert_eq!(db.mark_read(chris, &feed_a, Some(id("a3"))).unwrap(), 2);
+        let unread = ItemQuery {
+            unread: Some(true),
+            ..q()
+        };
+        assert_eq!(
+            list(chris, &unread),
+            ["a5", "a4", "b1"],
+            "b1 is another feed"
+        );
+        assert_eq!(list(anna, &unread).len(), 7, "anna's state is her own");
+
+        // Every list filter applies; search too.
+        let search = ItemQuery {
+            q: Some("b1".into()),
+            ..q()
+        };
+        assert_eq!(db.mark_read(chris, &search, None).unwrap(), 1);
+        assert_eq!(list(chris, &unread), ["a5", "a4"]);
+
+        // An item the user can't see marks nothing.
+        let c1 = db.items(anna, &q()).unwrap().items[0].id;
+        assert_eq!(db.mark_read(chris, &q(), Some(c1)).unwrap(), 0);
+        assert_eq!(list(chris, &unread), ["a5", "a4"]);
+
+        // No `from`: the whole list, however many pages.
+        assert_eq!(db.mark_read(chris, &q(), None).unwrap(), 2);
+        assert!(list(chris, &unread).is_empty());
+        assert!(db.feeds(chris).unwrap().iter().all(|f| f.unread == 0));
     }
 
     #[test]

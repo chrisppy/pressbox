@@ -7,8 +7,8 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use pressbox_api::{
-    ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, Me, PairApproved, PairRequest,
-    PairStart, PendingPairing, Updated, Version,
+    ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, MarkRead, Me, PairApproved,
+    PairRequest, PairStart, PendingPairing, Updated, Version,
 };
 use serde::Deserialize;
 
@@ -117,6 +117,23 @@ impl Client {
     pub fn mark_feed_read(&self, feed: &str) -> Result<u32> {
         let path = format!("/api/v1/feeds/{feed}/read-all");
         let updated: Updated = Self::send(self.request(reqwest::Method::POST, &path))?.json()?;
+        Ok(updated.updated)
+    }
+
+    /// Marks a list's items read (from `request.from` down, if set).
+    pub fn mark_read(&self, request: &MarkRead) -> Result<u32> {
+        let resp = self
+            .request(reqwest::Method::POST, "/api/v1/items/read-all")
+            .json(request)
+            .send()?;
+        // Servers without the route answer 404, or 405 (for /items/{id}).
+        if matches!(
+            resp.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            bail!("the server is too old to mark a list read; upgrade pressboxd");
+        }
+        let updated: Updated = Self::send_checked(resp)?.json()?;
         Ok(updated.updated)
     }
 
@@ -307,15 +324,27 @@ mod tests {
             (204, ""),
             (200, r#"{"updated":3}"#),
             (202, ""),
+            (200, r#"{"updated":2}"#),
+            (404, "{}"),
         ]);
         let client = Client::new(&base, Some("tok".into())).unwrap();
         client.set_read(7, true).unwrap();
         client.set_starred(7, false).unwrap();
         assert_eq!(client.mark_feed_read("blog").unwrap(), 3);
         client.refresh().unwrap();
+        let request = MarkRead {
+            query: ItemQuery {
+                feed: Some("blog".into()),
+                ..ItemQuery::default()
+            },
+            from: Some(9),
+        };
+        assert_eq!(client.mark_read(&request).unwrap(), 2);
+        let old = client.mark_read(&request).unwrap_err();
+        assert!(format!("{old:#}").contains("too old"), "{old:#}");
         let lines: Vec<String> = requests
             .iter()
-            .take(4)
+            .take(6)
             .map(|h| h.lines().next().unwrap().to_owned())
             .collect();
         assert_eq!(
@@ -325,6 +354,8 @@ mod tests {
                 "put /api/v1/items/7/starred http/1.1",
                 "post /api/v1/feeds/blog/read-all http/1.1",
                 "post /api/v1/refresh http/1.1",
+                "post /api/v1/items/read-all http/1.1",
+                "post /api/v1/items/read-all http/1.1",
             ]
         );
     }

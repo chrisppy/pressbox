@@ -24,6 +24,7 @@ is about that user's feeds and state. Timestamps are Unix seconds.
 | PUT | `/api/v1/items/{id}/read` | `{"value": bool}` | 204 |
 | PUT | `/api/v1/items/{id}/starred` | `{"value": bool}` | 204 |
 | POST | `/api/v1/feeds/{id}/read-all` | | `{"updated": n}` |
+| POST | `/api/v1/items/read-all` | the list's filters, optional `from` item id | `{"updated": n}` |
 | POST | `/api/v1/refresh` | | 202 |
 | GET | `/api/v1/pairings` | | `[{code, name, requested}]` |
 | POST | `/api/v1/pairings/{code}/approve` | optional `{"user": str}` (admins only) | `{name, user}` |
@@ -34,6 +35,12 @@ Item lists come newest first. To get the next page, pass the previous page's
 A cursor is opaque, and a malformed one is a 400. The older `offset` parameter
 (answered with `next_offset`) still works, but gets slower the further into a
 list it goes.
+
+`unread=false` lists only read items. `POST /api/v1/items/read-all` marks read
+every item a list shows, however many pages it has: its body takes the same
+filters as `GET /api/v1/items` (`feed`, `tag`, `unread`, `starred`, `q`), and
+with `"from": id` only that item and the older ones after it. `updated` counts
+the items that were unread.
 
 Responses are compressed (gzip or brotli) when the request's `Accept-Encoding`
 allows it.

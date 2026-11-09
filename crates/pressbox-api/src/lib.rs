@@ -78,6 +78,20 @@ pub struct Updated {
     pub updated: u32,
 }
 
+/// Body of `POST /api/v1/items/read-all`: marks the items a list shows as
+/// read, in one request however many pages the list has.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkRead {
+    /// The list's filters, as for `GET /api/v1/items`. `limit`, `offset`
+    /// and `cursor` are ignored.
+    #[serde(flatten)]
+    pub query: ItemQuery,
+    /// Only this item and the ones after it in the list (older ones), if
+    /// set. Nothing is marked if the user can't see this item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<i64>,
+}
+
 /// Query parameters for `GET /api/v1/items`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemQuery {
@@ -176,7 +190,6 @@ pub struct UserInfo {
     pub feeds: u32,
 }
 
-/// Response to `GET /api/v1/me`: who this token belongs to.
 /// The API version this crate describes: the `1` in `/api/v1`.
 pub const API_VERSION: u32 = 1;
 
@@ -189,6 +202,7 @@ pub struct Version {
     pub api: u32,
 }
 
+/// Response to `GET /api/v1/me`: who this token belongs to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Me {
     pub user: String,

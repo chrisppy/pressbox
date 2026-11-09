@@ -42,7 +42,8 @@ requests, and `pressbox whoami` shows the signed-in user and device.
 | `s` | Toggle star |
 | `o` | Open in browser (marks read) |
 | `A` | Mark the selected feed (or all feeds) read |
-| `u` | Toggle unread-only / all |
+| `M` | Mark the selected item and all below it read |
+| `u` | Cycle unread / all / read items |
 | `r` / `R` | Reload from server / ask server to refetch |
 | `q` | Quit |
 
