@@ -139,24 +139,7 @@ impl App {
     }
 
     fn open_reader(&mut self, client: Client) -> Task<Message> {
-        let mut reader = Reader {
-            client: client.clone(),
-            me: None,
-            version: None,
-            feeds: Vec::new(),
-            source: Source::Unread,
-            search: String::new(),
-            items: Vec::new(),
-            next_cursor: None,
-            loading: false,
-            generation: 0,
-            selected: None,
-            article: None,
-            article_text: String::new(),
-            approve_code: String::new(),
-            status: None,
-            error: None,
-        };
+        let mut reader = Reader::new(client.clone());
         let identity = Task::perform(
             {
                 let client = client.clone();
@@ -295,6 +278,28 @@ impl App {
 }
 
 impl Reader {
+    /// An empty reader showing unread items; nothing is loaded yet.
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            me: None,
+            version: None,
+            feeds: Vec::new(),
+            source: Source::Unread,
+            search: String::new(),
+            items: Vec::new(),
+            next_cursor: None,
+            loading: false,
+            generation: 0,
+            selected: None,
+            article: None,
+            article_text: String::new(),
+            approve_code: String::new(),
+            status: None,
+            error: None,
+        }
+    }
+
     fn query(&self) -> ItemQuery {
         let mut query = ItemQuery {
             limit: Some(PAGE),
@@ -673,5 +678,217 @@ mod tests {
         assert!(text.contains("world"));
         assert!(text.contains("one"));
         assert_eq!(render_html("  "), "");
+    }
+
+    fn reader() -> Reader {
+        Reader::new(Client::new("http://127.0.0.1:9", Some("t".into())).unwrap())
+    }
+
+    fn feed(id: &str, unread: u32, tags: &[&str]) -> Feed {
+        Feed {
+            id: id.into(),
+            title: format!("Feed {id}"),
+            url: format!("https://{id}.example/"),
+            site_url: None,
+            tags: tags.iter().map(|&t| t.into()).collect(),
+            unread,
+            total: unread,
+            last_fetched: None,
+            last_error: None,
+            archived: false,
+        }
+    }
+
+    fn item(id: i64, feed: &str) -> Item {
+        Item {
+            id,
+            feed_id: feed.into(),
+            title: format!("Item {id}"),
+            url: Some(format!("https://{feed}.example/{id}")),
+            author: None,
+            summary: Some(format!("<p>summary {id}</p>")),
+            content: None,
+            published: id,
+            read: false,
+            starred: false,
+        }
+    }
+
+    fn page(ids: &[i64], next_cursor: Option<&str>) -> ItemPage {
+        ItemPage {
+            items: ids.iter().map(|&id| item(id, "a")).collect(),
+            next_cursor: next_cursor.map(str::to_owned),
+            next_offset: None,
+        }
+    }
+
+    fn ids(r: &Reader) -> Vec<i64> {
+        r.items.iter().map(|i| i.id).collect()
+    }
+
+    #[test]
+    fn queries_follow_the_source_and_search() {
+        let mut r = reader();
+        assert_eq!(r.query().unread, Some(true));
+        r.source = Source::Starred;
+        r.search = "  rust  ".into();
+        let q = r.query();
+        assert_eq!(
+            (q.starred, q.unread, q.q.as_deref()),
+            (Some(true), None, Some("rust"))
+        );
+        r.source = Source::Tag("nix".into());
+        r.search = "   ".into();
+        let q = r.query();
+        assert_eq!((q.tag.as_deref(), q.q), (Some("nix"), None));
+        r.source = Source::Feed("a".into());
+        assert_eq!(r.query().feed.as_deref(), Some("a"));
+        assert_eq!(r.query().limit, Some(PAGE));
+    }
+
+    #[test]
+    fn pages_append_and_stale_pages_are_dropped() {
+        let mut r = reader();
+        let _ = r.reload();
+        let first = r.generation;
+        let _ = r.update(Message::ItemsLoaded(
+            first,
+            false,
+            Ok(page(&[3, 2], Some("c"))),
+        ));
+        assert_eq!(
+            (ids(&r), r.next_cursor.as_deref(), r.loading),
+            (vec![3, 2], Some("c"), false)
+        );
+
+        let _ = r.update(Message::LoadMore);
+        assert!(r.loading);
+        let _ = r.update(Message::ItemsLoaded(first, true, Ok(page(&[1], None))));
+        assert_eq!((ids(&r), r.next_cursor.clone()), (vec![3, 2, 1], None));
+        let _ = r.update(Message::LoadMore);
+        assert!(!r.loading, "no cursor, nothing to load");
+
+        // A page for a list that has since been reloaded is ignored.
+        let _ = r.update(Message::Select(Source::All));
+        let _ = r.update(Message::ItemsLoaded(first, false, Ok(page(&[9], None))));
+        assert_eq!(ids(&r), [3, 2, 1]);
+        assert!(r.loading);
+        let _ = r.update(Message::ItemsLoaded(
+            r.generation,
+            false,
+            Err("boom".into()),
+        ));
+        assert_eq!((r.error.as_deref(), r.loading), (Some("boom"), false));
+        let _ = r.update(Message::Dismiss);
+        assert_eq!(r.error, None);
+    }
+
+    #[test]
+    fn opening_marks_read_and_keeps_counts() {
+        let mut r = reader();
+        r.feeds = vec![feed("a", 2, &[])];
+        r.items = vec![item(2, "a"), item(1, "a")];
+        let _ = r.update(Message::Next);
+        assert_eq!(
+            r.selected,
+            Some(2),
+            "Next with nothing open opens the first"
+        );
+        assert!(r.items[0].read && r.article.as_ref().unwrap().read);
+        assert!(r.article_text.contains("summary 2"));
+        assert_eq!(r.feeds[0].unread, 1);
+
+        // A failed flag is put back.
+        let _ = r.update(Message::Flagged(2, Flag::Read, true, Err("offline".into())));
+        assert!(!r.items[0].read);
+        assert_eq!(
+            (r.feeds[0].unread, r.error.as_deref()),
+            (2, Some("offline"))
+        );
+
+        // The full item replaces the summary, but local flags win a race.
+        r.items[0].starred = true;
+        let mut full = item(2, "a");
+        full.content = Some("<p>full text</p>".into());
+        let _ = r.update(Message::ItemLoaded(Ok(full)));
+        assert!(r.article_text.contains("full text"));
+        assert!(r.article.as_ref().unwrap().starred);
+        let _ = r.update(Message::ItemLoaded(Ok(item(1, "a"))));
+        assert_eq!(r.article.as_ref().unwrap().id, 2, "not the open item");
+
+        let _ = r.update(Message::Toggle(Flag::Starred));
+        assert!(!r.items[0].starred && !r.article.as_ref().unwrap().starred);
+        let _ = r.update(Message::Next);
+        assert_eq!(r.selected, Some(1));
+        let _ = r.update(Message::Next);
+        assert_eq!(r.selected, Some(1), "stays on the last item");
+        let _ = r.update(Message::Previous);
+        assert_eq!(r.selected, Some(2));
+    }
+
+    #[test]
+    fn tags_sum_unread_counts() {
+        let mut r = reader();
+        r.feeds = vec![
+            feed("a", 2, &["tech", "news"]),
+            feed("b", 3, &["tech"]),
+            feed("c", 0, &[]),
+        ];
+        assert_eq!(r.tags(), [("news".to_owned(), 2), ("tech".to_owned(), 5)]);
+        assert_eq!(r.feed_title("b"), "Feed b");
+        assert_eq!(r.feed_title("zz"), "zz");
+        r.source = Source::Tag("tech".into());
+        assert_eq!(r.source_title(), "#tech");
+        r.source = Source::Feed("a".into());
+        assert_eq!(r.source_title(), "Feed a");
+    }
+
+    #[test]
+    fn approve_codes_are_uppercased() {
+        let mut r = reader();
+        let _ = r.update(Message::ApproveCodeChanged("k7w-4qx".into()));
+        assert_eq!(r.approve_code, "K7W-4QX");
+        let _ = r.update(Message::Approved(Ok(pressbox_api::Approved {
+            name: "phone".into(),
+            user: "chris".into(),
+        })));
+        assert!(r.approve_code.is_empty());
+        assert_eq!(r.status.as_deref(), Some("Approved phone for chris"));
+        let _ = r.update(Message::MarkedAllRead(Ok(1)));
+        assert_eq!(r.status.as_deref(), Some("Marked 1 item as read"));
+    }
+
+    #[test]
+    fn keys() {
+        use keyboard::{Key, Location, Modifiers, key::Named};
+        let press = |key: Key, modifiers| keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: Location::Standard,
+            modifiers,
+            text: None,
+            repeat: false,
+        };
+        let char = |c: &str| Key::Character(c.into());
+        assert!(matches!(
+            on_key(press(char("j"), Modifiers::empty())),
+            Some(Message::Next)
+        ));
+        assert!(matches!(
+            on_key(press(Key::Named(Named::ArrowUp), Modifiers::empty())),
+            Some(Message::Previous)
+        ));
+        assert!(matches!(
+            on_key(press(char("s"), Modifiers::empty())),
+            Some(Message::Toggle(Flag::Starred))
+        ));
+        assert!(
+            on_key(press(char("j"), Modifiers::CTRL)).is_none(),
+            "shortcuts pass"
+        );
+        assert!(on_key(press(char("x"), Modifiers::empty())).is_none());
     }
 }
