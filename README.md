@@ -23,7 +23,7 @@ show the unread count.
 NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items, search index, devices)
 (services.pressbox.feeds)            │ HTTP API, one token per device
                    ┌───────────────┼────────────────┐
-               pressbox      Birdland bar        iOS app
+             TUI, desktop    Birdland bar        iOS app
                            pressboxctl (control socket, on the server)
 ```
 
@@ -33,6 +33,7 @@ NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items
 | `pressboxctl` | `crates/pressboxd/src/bin` | Pairing, devices, backups, OPML |
 | `pressbox-api` | `crates/pressbox-api` | JSON types shared by the Rust crates |
 | `pressbox` | `clients/tui` | Terminal client (ratatui) |
+| `pressbox-iced` | `clients/iced` | Desktop client (iced) |
 | iOS app | [pressbox-ios](https://github.com/chrisppy/pressbox-ios) | SwiftUI client, in its own repo |
 | NixOS module | `modules/nixos.nix` | `services.pressbox` |
 | Home Manager module | `modules/home-manager.nix` | `programs.pressbox` |
@@ -43,8 +44,8 @@ NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items
   feeds are fetched, systemd
 - [Pairing devices](./docs/pairing.md): giving each client its own token
 - [pressboxctl](./docs/pressboxctl.md): the admin CLI on the server
-- [Clients (Home Manager)](./docs/clients.md): the terminal client and the
-  Birdland bar
+- [Clients (Home Manager)](./docs/clients.md): the terminal and desktop
+  clients and the Birdland bar
 - [API](./docs/api.md): the HTTP API clients use
 
 ## iOS
@@ -71,7 +72,7 @@ pressbox/
 │   │       ├── pairing.rs         device tokens and pairing codes
 │   │       ├── systemd.rs         notify, watchdog, sockets, journal
 │   │       └── bin/pressboxctl.rs admin CLI, feed discovery, OPML
-│   └── pressbox-api/              JSON types shared with the TUI
+│   └── pressbox-api/              JSON types shared with the clients
 ├── clients/
 │   ├── tui/                       pressbox, terminal client
 │   │   └── src/
@@ -79,12 +80,20 @@ pressbox/
 │   │       ├── client.rs          HTTP client, client.json, token
 │   │       ├── app.rs             state and keys (tested without a terminal)
 │   │       └── ui.rs              drawing
+│   ├── iced/                      pressbox-iced, desktop client
+│   │   └── src/
+│   │       ├── main.rs            window settings
+│   │       ├── app.rs             state, messages and updates
+│   │       ├── ui.rs              pairing screen and the three panes
+│   │       ├── api.rs             async HTTP client
+│   │       ├── config.rs          client.json and token, shared with the TUI
+│   │       └── theme.rs           Birdland and Birdland Light
 ├── modules/
 │   ├── nixos.nix                  services.pressbox (AGPL-3.0-only)
 │   └── home-manager.nix           programs.pressbox
 ├── nix/                           flake-parts modules, loaded by devfmt
 │   ├── rust.nix                   Rust toolchain (fenix) and crane
-│   ├── packages.nix               pressboxd, pressbox (crane), Clippy check
+│   ├── packages.nix               pressboxd, pressbox, pressbox-iced (crane), Clippy
 │   ├── modules.nix                exports the NixOS and Home Manager modules
 │   ├── checks.nix                 module checks, NixOS VM test, reuse lint
 │   └── devshell.nix               nix develop
@@ -130,8 +139,8 @@ generates: `listen`, `database`, `refresh_interval`, `max_items_per_feed`,
 `[users.<name>]` with `admin` and `[users.<name>.feeds.<id>]`) and run
 `just server` (or `cargo run -p pressboxd -- -c pressbox.toml`). The control
 socket defaults to `pressbox.sock` next to the database:
-`just ctl -s ./pressbox.sock status`. `just tui` runs the terminal client the
-same way.
+`just ctl -s ./pressbox.sock status`. `just tui` and `just gui` run the
+terminal and desktop clients the same way.
 
 ## License
 
@@ -143,8 +152,9 @@ license in an SPDX header (`reuse lint` checks this, also in `nix flake check`).
   [GNU Affero General Public License v3.0 only](LICENSES/AGPL-3.0-only.txt). If
   you let others use a modified server over a network, you must offer them its
   source.
-- The terminal client (`pressbox`), the shared `pressbox-api` types, the Home
-  Manager module, and the build files and docs are licensed under the
+- The terminal and desktop clients (`pressbox`, `pressbox-iced`), the shared
+  `pressbox-api` types, the Home Manager module, and the build files and docs
+  are licensed under the
   [GNU General Public License v3.0 only](LICENSES/GPL-3.0-only.txt).
 - The logo (`assets/logo.svg`) is licensed under
   [Creative Commons Attribution-ShareAlike 4.0](LICENSES/CC-BY-SA-4.0.txt).

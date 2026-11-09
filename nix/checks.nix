@@ -90,6 +90,10 @@
         enable = true;
         tui.enable = false;
       };
+      desktop = evalHomeManager {
+        enable = true;
+        desktop.enable = true;
+      };
       pairedJson = builtins.fromJSON paired.config.xdg.configFile."pressbox/client.json".text;
 
       expect =
@@ -100,7 +104,7 @@
     in
     {
       checks = {
-        inherit (config.packages) pressboxd pressbox;
+        inherit (config.packages) pressboxd pressbox pressbox-iced;
 
         # Every file has an SPDX license and copyright (https://reuse.software).
         reuse = pkgs.runCommand "pressbox-reuse-lint" { nativeBuildInputs = [ pkgs.reuse ]; } ''
@@ -162,6 +166,10 @@
           assert expect "packages" (map lib.getName homeManager.config.home.packages) [ "pressbox" ];
           assert expect "paired client.json" pairedJson { server = "http://127.0.0.1:8470"; };
           assert expect "no TUI" paired.config.home.packages [ ];
+          assert expect "desktop" (map lib.getName desktop.config.home.packages) [
+            "pressbox"
+            "pressbox-iced"
+          ];
           pkgs.emptyFile;
       }
       // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {

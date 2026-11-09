@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-3.0-only
 
 [workspace]
-members  = ["crates/*", "clients/tui"]
+members  = ["crates/*", "clients/tui", "clients/iced"]
 resolver = "3"
 
 [workspace.package]

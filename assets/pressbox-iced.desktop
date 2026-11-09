@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
+# SPDX-License-Identifier: GPL-3.0-only
+
+[Desktop Entry]
+Type=Application
+Name=pressbox
+GenericName=Feed Reader
+Comment=Read your pressbox feeds
+Exec=pressbox-iced
+Icon=pressbox-iced
+Categories=Network;News;Feed;
+Keywords=rss;atom;feeds;news;
+StartupWMClass=pressbox-iced

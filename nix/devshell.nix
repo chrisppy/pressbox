@@ -5,13 +5,17 @@ _: {
   perSystem =
     {
       pkgs,
+      lib,
       config,
       craneLib,
+      guiRuntimeLibs,
       ...
     }:
     {
       # The same fenix toolchain the packages build with (cargo, rustc, clippy,
-      # rustfmt, rust-analyzer, rust-src), plus the packages' build inputs.
+      # rustfmt, rust-analyzer, rust-src), plus the packages' build inputs and
+      # the libraries pressbox-iced opens at run time, so `just gui` finds a
+      # display.
       devShells.default = craneLib.devShell {
         inputsFrom = [ config.packages.pressboxd ];
         packages = [
@@ -20,6 +24,7 @@ _: {
           pkgs.sqlite
           config.treefmt.build.wrapper
         ];
+        LD_LIBRARY_PATH = lib.makeLibraryPath guiRuntimeLibs;
       };
 
       formatter = config.treefmt.build.wrapper;

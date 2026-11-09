@@ -9,11 +9,14 @@ all-features = true
 
 [licenses]
 # Licenses dependencies may use: only those in use today, all compatible
-# with linking into the AGPL-3.0-only server and the GPL-3.0-only TUI.
+# with linking into the AGPL-3.0-only server and the GPL-3.0-only clients.
 # Anything else fails CI until someone checks it and adds it here.
 allow = [
   "Apache-2.0",
+  "BSD-2-Clause",
   "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
   "CDLA-Permissive-2.0",
   "ISC",
   "MIT",
@@ -30,7 +33,15 @@ ignore = true
 [advisories]
 # Every RustSec advisory fails, including unmaintained crates and yanked
 # versions, unless listed in `ignore` with a reason.
-ignore = []
+ignore = [
+  # Unmaintained, no replacement yet; all come in through iced 0.14 for
+  # pressbox-iced only. Drop each once an iced release moves off it.
+  { id = "RUSTSEC-2024-0436", reason = "paste, a proc-macro used by wgpu's Metal backend (macOS)" },
+  { id = "RUSTSEC-2026-0192", reason = "ttf-parser, via cosmic-text and fontdb" },
+  { id = "RUSTSEC-2026-0370", reason = "zvariant, folded into zbus; via mundy (dark mode)" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names, folded into zbus; via mundy (dark mode)" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, folded into zbus; via mundy (dark mode)" },
+]
 yanked = "deny"
 
 [bans]

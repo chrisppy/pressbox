@@ -18,7 +18,11 @@ Import `inputs.pressbox.homeManagerModules.default`:
 
 This writes `~/.config/pressbox/client.json` and installs `pressbox`. Pairing
 saves the token to `$XDG_STATE_HOME/pressbox/token`; set `tokenFile` only to use
-a token from somewhere else.
+a token from somewhere else. Both clients read these files, so pairing one pairs
+both.
+
+Set `desktop.enable = true` to also install `pressbox-iced`, the desktop
+client, and `tui.enable = false` to leave out the terminal one.
 
 ### pressbox (terminal client)
 
@@ -41,6 +45,32 @@ requests, and `pressbox whoami` shows the signed-in user and device.
 | `u` | Toggle unread-only / all |
 | `r` / `R` | Reload from server / ask server to refetch |
 | `q` | Quit |
+
+### pressbox-iced (desktop client)
+
+A window with three panes: sources (Unread, All items, Starred, tags and feeds,
+with unread counts), the item list with search, and the article. Opening an item
+marks it read. Its desktop entry is named "pressbox", and its Wayland app ID is
+`pressbox-iced`, for window rules.
+
+On a machine that isn't paired yet it asks for the server and a device name and
+shows a code to approve, as `pressbox pair` does; it then saves the token where
+the TUI looks, and writes `client.json` only if that has no server (so a file
+Home Manager manages is left alone). The sidebar can approve another device's
+code, ask the server to refetch every feed, and sign out, which deletes the
+token.
+
+| Key | Action |
+| --------- | ------------------- |
+| `j` / `↓` | Next item |
+| `k` / `↑` | Previous item |
+| `s` | Toggle star |
+| `m` | Toggle read |
+| `o` | Open in browser |
+| `Esc` | Dismiss a message |
+
+Colors are [Birdland](https://github.com/chrisppy/base24-themes), and Birdland
+Light when the system is in light mode.
 
 ### In the Birdland bar
 

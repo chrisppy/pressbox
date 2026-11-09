@@ -30,6 +30,16 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
   database column records each one's digest as sent), and per-feed pruning only
   runs when something was added or `maxAgeDays` is set.
 
+### Desktop client
+
+- `pressbox-iced`, a desktop reader built with iced 0.14 (`clients/iced`):
+  sources with unread counts (unread, all, starred, tags, feeds), the item
+  list with search and paging, and the article with star, read/unread and open
+  in browser. Pairs itself, or uses the TUI's `client.json` and token; can
+  approve other devices. Birdland colors, following the system's light or dark
+  mode. Packaged with a desktop entry; Home Manager installs it with
+  `programs.pressbox.desktop.enable`.
+
 ### Terminal client
 
 - Pages by cursor, falling back to offsets with an older server; asks for gzip

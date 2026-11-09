@@ -24,6 +24,7 @@ let
   homeManager = withPackages ../modules/home-manager.nix {
     programs.pressbox = {
       tui.package = "pressbox";
+      desktop.package = "pressbox-iced";
     };
   };
 in

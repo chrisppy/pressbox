@@ -43,7 +43,11 @@ ctl *args:
 tui *args:
     {{ cargo }} run -q -p pressbox -- {{ args }}
 
-# Build a package with Nix: pressboxd (default) or pressbox
+# Run the desktop client (reads client.json and the token like the TUI)
+gui:
+    {{ cargo }} run -q -p pressbox-iced
+
+# Build a package with Nix: pressboxd (default), pressbox or pressbox-iced
 package name="pressboxd":
     nix build .#{{ name }}
 
