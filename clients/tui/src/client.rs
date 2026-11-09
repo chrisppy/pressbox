@@ -80,31 +80,11 @@ impl Client {
     }
 
     pub fn items(&self, query: &ItemQuery) -> Result<ItemPage> {
-        let mut pairs: Vec<(&str, String)> = Vec::new();
-        if let Some(f) = &query.feed {
-            pairs.push(("feed", f.clone()));
-        }
-        if let Some(t) = &query.tag {
-            pairs.push(("tag", t.clone()));
-        }
-        if let Some(u) = query.unread {
-            pairs.push(("unread", u.to_string()));
-        }
-        if let Some(s) = query.starred {
-            pairs.push(("starred", s.to_string()));
-        }
-        if let Some(q) = &query.q {
-            pairs.push(("q", q.clone()));
-        }
-        if let Some(l) = query.limit {
-            pairs.push(("limit", l.to_string()));
-        }
-        if let Some(o) = query.offset {
-            pairs.push(("offset", o.to_string()));
-        }
+        // `ItemQuery` serializes to exactly the query string the server
+        // reads, unset fields left out, so new fields can't be forgotten.
         Ok(Self::send(
             self.request(reqwest::Method::GET, "/api/v1/items")
-                .query(&pairs),
+                .query(query),
         )?
         .json()?)
     }
@@ -208,7 +188,146 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::{BufRead, BufReader, Read, Write},
+        net::TcpListener,
+        sync::mpsc,
+    };
+
     use super::*;
+
+    /// Serves one canned `(status, json)` response per connection, in order,
+    /// and reports each request's line and headers, lowercased.
+    fn server(responses: Vec<(u16, &'static str)>) -> (String, mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut head = String::new();
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let line = line.trim_end().to_lowercase();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(n) = line.strip_prefix("content-length: ") {
+                        length = n.parse().unwrap();
+                    }
+                    head.push_str(&line);
+                    head.push('\n');
+                }
+                reader.read_exact(&mut vec![0; length]).unwrap();
+                tx.send(head).unwrap();
+                write!(
+                    reader.get_mut(),
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (base, rx)
+    }
+
+    const PAGE: &str = r#"{"items":[],"next_cursor":null}"#;
+
+    #[test]
+    fn items_send_every_query_field() {
+        let (base, requests) = server(vec![(200, PAGE)]);
+        let client = Client::new(&format!("{base}/"), Some("tok".into())).unwrap();
+        let query = ItemQuery {
+            q: Some("rust nix".into()),
+            feed: Some("a".into()),
+            unread: Some(true),
+            limit: Some(100),
+            cursor: Some("1793700000.42".into()),
+            ..ItemQuery::default()
+        };
+        assert!(client.items(&query).unwrap().items.is_empty());
+        let head = requests.recv().unwrap();
+        let line = head.lines().next().unwrap();
+        assert!(line.starts_with("get /api/v1/items?"), "{line}");
+        for part in [
+            "q=rust+nix",
+            "feed=a",
+            "unread=true",
+            "limit=100",
+            "cursor=1793700000.42",
+        ] {
+            assert!(line.contains(part), "{part} missing from {line}");
+        }
+        assert!(!line.contains("offset") && !line.contains("tag"), "{line}");
+        assert!(head.contains("authorization: bearer tok"), "{head}");
+    }
+
+    #[test]
+    fn errors_are_explained() {
+        let (base, _requests) = server(vec![
+            (401, "{}"),
+            (500, "{}"),
+            (202, r#"{"status":"pending"}"#),
+            (404, "{}"),
+            (404, "{}"),
+            (403, "{}"),
+            (200, r#"{"name":"phone","user":"chris"}"#),
+        ]);
+        let client = Client::new(&base, None).unwrap();
+        let error = |r: Result<Vec<Feed>>| format!("{:#}", r.unwrap_err());
+        assert_eq!(error(client.feeds()), "the server rejected the token (401)");
+        assert!(error(client.feeds()).contains("500"));
+        assert_eq!(client.pair_poll("p").unwrap(), None, "still waiting");
+        assert!(format!("{:#}", client.pair_poll("p").unwrap_err()).contains("denied or expired"));
+        assert!(
+            format!("{:#}", client.approve(" K7W-4QX ", None).unwrap_err()).contains("K7W-4QX")
+        );
+        assert!(
+            format!(
+                "{:#}",
+                client.approve("K7W-4QX", Some("anna".into())).unwrap_err()
+            )
+            .contains("only admins")
+        );
+        let approved = client.approve("K7W-4QX", None).unwrap();
+        assert_eq!(
+            (approved.name.as_str(), approved.user.as_str()),
+            ("phone", "chris")
+        );
+    }
+
+    #[test]
+    fn writes_use_the_right_routes() {
+        let (base, requests) = server(vec![
+            (204, ""),
+            (204, ""),
+            (200, r#"{"updated":3}"#),
+            (202, ""),
+        ]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        client.set_read(7, true).unwrap();
+        client.set_starred(7, false).unwrap();
+        assert_eq!(client.mark_feed_read("blog").unwrap(), 3);
+        client.refresh().unwrap();
+        let lines: Vec<String> = requests
+            .iter()
+            .take(4)
+            .map(|h| h.lines().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "put /api/v1/items/7/read http/1.1",
+                "put /api/v1/items/7/starred http/1.1",
+                "post /api/v1/feeds/blog/read-all http/1.1",
+                "post /api/v1/refresh http/1.1",
+            ]
+        );
+    }
 
     #[test]
     fn reads_home_manager_config() {
