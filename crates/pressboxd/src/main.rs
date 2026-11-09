@@ -150,6 +150,9 @@ impl AppState {
     }
 }
 
+// Not measured: sets the process-wide logger, which a test process can
+// only do once, and it decides where every other test's logs go.
+#[cfg(not(tarpaulin_include))]
 fn init_logging() {
     use tracing_subscriber::{EnvFilter, Registry, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -171,75 +174,110 @@ fn init_logging() {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
+// Not measured: only wires the process (logging, arguments, signals) to
+// `Server`, which the tests start and stop themselves.
+#[cfg(not(tarpaulin_include))]
 #[tokio::main]
 async fn main() -> Result<()> {
     init_logging();
-
     let args = Args::parse();
     let config = Config::load(&args.config)?;
     if args.check {
-        println!(
-            "{}: ok, {} feeds",
-            args.config.display(),
-            config.feed_count()
-        );
+        println!("{}", check_summary(&args.config, &config));
         return Ok(());
     }
+    Server::start(&config, systemd::listener()?)
+        .await?
+        .run(shutdown())
+        .await
+}
 
-    let mut db = Db::open(&config.database)
-        .with_context(|| format!("opening {}", config.database.display()))?;
-    db.sync(&config)?;
-    let mut state = AppState::new(db, config.token()?, config.max_items_per_feed)?
-        .with_readers(&config.database, READERS)?;
-    state.backup_dir = config.backup_dir();
-    state.behind_proxy = config.behind_proxy;
-    state.max_age_days = config.max_age_days;
-    let state = Arc::new(state);
+/// What `pressboxd --check` prints for a valid configuration.
+fn check_summary(path: &std::path::Path, config: &Config) -> String {
+    format!("{}: ok, {} feeds", path.display(), config.feed_count())
+}
 
-    let (listener, address) = match systemd::listener()? {
-        Some(socket) => {
-            let address = socket.local_addr()?;
-            info!("using the socket from systemd ({address}); `listen` is ignored");
-            (tokio::net::TcpListener::from_std(socket)?, address)
-        }
-        None => (
-            tokio::net::TcpListener::bind(config.listen)
+/// A server ready to run: its database open and in step with the
+/// configuration, and its sockets bound.
+struct Server {
+    state: Arc<AppState>,
+    listener: tokio::net::TcpListener,
+    address: std::net::SocketAddr,
+    control: tokio::net::UnixListener,
+    control_path: PathBuf,
+    feeds: usize,
+    refresh_interval: u64,
+}
+
+impl Server {
+    /// Opens and syncs the database and binds the API and control sockets.
+    /// `inherited` is a listening socket from systemd, used instead of
+    /// binding `listen`.
+    async fn start(config: &Config, inherited: Option<std::net::TcpListener>) -> Result<Self> {
+        let mut db = Db::open(&config.database)
+            .with_context(|| format!("opening {}", config.database.display()))?;
+        db.sync(config)?;
+        let mut state = AppState::new(db, config.token()?, config.max_items_per_feed)?
+            .with_readers(&config.database, READERS)?;
+        state.backup_dir = config.backup_dir();
+        state.behind_proxy = config.behind_proxy;
+        state.max_age_days = config.max_age_days;
+        let state = Arc::new(state);
+
+        let listener = match inherited {
+            Some(socket) => {
+                let inherited = socket.local_addr()?;
+                info!("using the socket from systemd ({inherited}); `listen` is ignored");
+                tokio::net::TcpListener::from_std(socket)?
+            }
+            None => tokio::net::TcpListener::bind(config.listen)
                 .await
                 .with_context(|| format!("binding {}", config.listen))?,
-            config.listen,
-        ),
-    };
-    let control_path = config.control_socket();
-    let control = admin::bind(&control_path)?;
-    let feeds = config.feed_count();
-    info!(
-        "listening on {address} with {feeds} feeds; control socket {}",
-        control_path.display()
-    );
-    if state.token.is_none() && state.reader().counts()?.devices == 0 {
-        info!(
-            "no devices paired yet: run `pressboxctl pair` on a client, then `pressboxctl approve`"
-        );
-    }
-    systemd::ready(&format!("listening on {address}, {feeds} feeds"));
-    systemd::spawn_watchdog(state.clone());
-
-    tokio::spawn(schedule(state.clone(), config.refresh_interval));
-    let admin_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = axum::serve(control, admin::router(admin_state)).await {
-            tracing::error!("control socket: {e}");
+        };
+        let address = listener.local_addr()?;
+        let control_path = config.control_socket();
+        let control = admin::bind(&control_path)?;
+        let feeds = config.feed_count();
+        let shown = control_path.display();
+        info!("listening on {address} with {feeds} feeds; control socket {shown}");
+        if state.token.is_none() && state.reader().counts()?.devices == 0 {
+            info!(
+                "no devices paired yet: run `pressboxctl pair` on a client, then `pressboxctl approve`"
+            );
         }
-    });
+        Ok(Self {
+            state,
+            listener,
+            address,
+            control,
+            control_path,
+            feeds,
+            refresh_interval: config.refresh_interval,
+        })
+    }
 
-    axum::serve(
-        listener,
-        api::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown())
-    .await?;
-    let _ = std::fs::remove_file(&control_path);
-    Ok(())
+    /// Serves the API and control socket and fetches feeds until `shutdown`
+    /// finishes, then removes the control socket.
+    async fn run(self, shutdown: impl Future<Output = ()> + Send + 'static) -> Result<()> {
+        let state = self.state;
+        systemd::ready(&format!(
+            "listening on {}, {} feeds",
+            self.address, self.feeds
+        ));
+        systemd::spawn_watchdog(state.clone());
+        let scheduler = tokio::spawn(schedule(state.clone(), self.refresh_interval));
+        let control = axum::serve(self.control, admin::router(state.clone()));
+        let control = tokio::spawn(control.into_future());
+
+        let api = api::router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
+        let served = axum::serve(self.listener, api)
+            .with_graceful_shutdown(shutdown)
+            .await;
+        scheduler.abort();
+        control.abort();
+        let _ = std::fs::remove_file(&self.control_path);
+        Ok(served?)
+    }
 }
 
 /// Fetches feeds as they come due, sleeping until the next one (at most five
@@ -286,6 +324,9 @@ fn status_line(
     s
 }
 
+// Not measured: waits for a signal to this process. `Server::run` takes any
+// future, and the tests pass their own.
+#[cfg(not(tarpaulin_include))]
 async fn shutdown() {
     let ctrl_c = tokio::signal::ctrl_c();
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -308,6 +349,193 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+
+    /// A config in a fresh directory, listening on a free local port.
+    fn server_config(name: &str, extra: &str) -> (Config, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("pressboxd-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = Config::parse(&format!(
+            r#"
+            database = "{db}"
+            listen = "127.0.0.1:0"
+            control_socket = "{sock}"
+            {extra}
+            [feeds.a]
+            url = "https://a.example/feed"
+            "#,
+            db = dir.join("data/pressbox.db").display(),
+            sock = dir.join("control.sock").display(),
+        ))
+        .unwrap();
+        (config, dir)
+    }
+
+    /// Sends one request over the control socket, as pressboxctl does.
+    async fn control_get(path: &std::path::Path, uri: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        stream
+            .write_all(
+                format!("GET {uri} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        response
+    }
+
+    /// Starts a server, uses both of its sockets, and shuts it down.
+    #[test]
+    fn serves_until_shut_down() {
+        let _env = systemd::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (config, dir) = server_config("serve", "");
+        let token = dir.join("token");
+        std::fs::write(&token, "static-secret\n").unwrap();
+        let config = Config {
+            token_file: Some(token),
+            ..config
+        };
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let server = Server::start(&config, None).await.unwrap();
+                let address = server.address;
+                assert_ne!(address.port(), 0, "the port actually bound");
+                let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+                let running = tokio::spawn(server.run(async {
+                    let _ = stopped.await;
+                }));
+
+                let http = reqwest::Client::builder().no_proxy().build().unwrap();
+                let base = format!("http://{address}");
+                let health = http.get(format!("{base}/health")).send().await.unwrap();
+                assert_eq!(health.text().await.unwrap(), "ok");
+                let me = http
+                    .get(format!("{base}/api/v1/me"))
+                    .bearer_auth("static-secret")
+                    .send()
+                    .await
+                    .unwrap()
+                    .text()
+                    .await
+                    .unwrap();
+                let me: pressbox_api::Me = serde_json::from_str(&me).unwrap();
+                assert_eq!((me.user.as_str(), me.device), ("default", None));
+
+                let control = dir.join("control.sock");
+                let status = control_get(&control, "/admin/status").await;
+                assert!(status.starts_with("HTTP/1.1 200"), "{status}");
+                assert!(status.contains(r#""feeds":1"#), "{status}");
+
+                // A second server can't take the same port.
+                let taken = Config {
+                    listen: address,
+                    control_socket: Some(dir.join("other.sock")),
+                    ..config.clone()
+                };
+                let error = Server::start(&taken, None).await.err().unwrap();
+                assert!(format!("{error}").starts_with("binding"), "{error}");
+
+                stop.send(()).unwrap();
+                running.await.unwrap().unwrap();
+                assert!(!control.exists(), "the control socket is removed");
+                assert!(
+                    http.get(format!("{base}/health")).send().await.is_err(),
+                    "no longer listening"
+                );
+            });
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn uses_a_socket_from_systemd_and_reports_bad_configs() {
+        let _env = systemd::ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (config, dir) = server_config("inherit", "");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let address = socket.local_addr().unwrap();
+            let server = Server::start(&config, Some(socket)).await.unwrap();
+            assert_eq!(server.address, address, "`listen` is ignored");
+            server.run(async {}).await.unwrap();
+
+            let unreadable = Config {
+                token_file: Some(dir.join("missing-token")),
+                ..config.clone()
+            };
+            let error = Server::start(&unreadable, None).await.err().unwrap();
+            assert!(
+                format!("{error}").starts_with("reading token file"),
+                "{error}"
+            );
+            let no_database = Config {
+                database: PathBuf::from("/proc/pressbox.db"),
+                ..config.clone()
+            };
+            let error = Server::start(&no_database, None).await.err().unwrap();
+            assert!(format!("{error}").starts_with("opening /proc"), "{error}");
+        });
+        assert_eq!(
+            check_summary(std::path::Path::new("/etc/pressbox.toml"), &config),
+            "/etc/pressbox.toml: ok, 1 feeds"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refresh_wakes_the_scheduler_even_if_the_database_fails() {
+        let state = Arc::new(AppState::new(Db::open_in_memory().unwrap(), None, 10).unwrap());
+        state.db().break_with("DROP TABLE subscriptions;");
+        state.request_refresh().await;
+        tokio::time::timeout(Duration::from_secs(1), state.refresh.notified())
+            .await
+            .expect("woken");
+    }
+
+    #[test]
+    fn readers_wait_when_every_connection_is_busy() {
+        let path = std::env::temp_dir().join(format!("pressboxd-busy-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).unwrap();
+        let state = Arc::new(
+            AppState::new(db, None, 10)
+                .unwrap()
+                .with_readers(&path, 2)
+                .unwrap(),
+        );
+        let (first, second) = (state.reader(), state.reader());
+        let (done_tx, done) = std::sync::mpsc::channel();
+        let waiter = {
+            let state = state.clone();
+            std::thread::spawn(move || {
+                state.reader().ping().unwrap();
+                done_tx.send(()).unwrap();
+            })
+        };
+        assert!(
+            done.recv_timeout(Duration::from_millis(100)).is_err(),
+            "both busy: it waits"
+        );
+        drop((first, second));
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        waiter.join().unwrap();
+        drop(state);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
+    }
 
     #[test]
     fn status_line_sums_up() {

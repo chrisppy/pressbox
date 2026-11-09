@@ -174,10 +174,11 @@ impl Pairings {
         if pending[&key].approved.is_none() {
             return PollState::Pending;
         }
-        match pending.remove(&key).and_then(|p| p.approved) {
-            Some(approved) => PollState::Approved(approved),
-            None => PollState::Gone,
-        }
+        // Approved: hand the token over once, and forget the request.
+        pending
+            .remove(&key)
+            .and_then(|p| p.approved)
+            .map_or(PollState::Gone, PollState::Approved)
     }
 
     pub fn list(&self, now: i64) -> Vec<PendingPairing> {

@@ -526,6 +526,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn database_failures_are_500s_without_details() {
+        let s = state();
+        // A device whose last_seen can't be recorded still gets in.
+        let user = s.db().only_user().unwrap().unwrap();
+        let token = crate::pairing::create_device(&s.db(), &user, "pc", now())
+            .unwrap()
+            .token;
+        s.db().break_with(
+            "CREATE TRIGGER read_only BEFORE UPDATE ON devices
+             BEGIN SELECT RAISE(ABORT, 'read-only'); END;",
+        );
+        let (status, _) = call(&s, "GET", "/api/v1/me", None, Some(&token)).await;
+        assert_eq!(status, StatusCode::OK);
+
+        s.db()
+            .break_with("DROP TABLE subscriptions; DROP TABLE devices;");
+        for uri in ["/api/v1/feeds", "/api/v1/items"] {
+            let (status, body) = call(&s, "GET", uri, None, T).await;
+            assert_eq!(
+                (status, body.as_str()),
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"internal error"}"#
+                ),
+                "{uri}"
+            );
+        }
+        let (status, _) = call(&s, "GET", "/api/v1/me", None, Some(&token)).await;
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "device lookup failed"
+        );
+    }
+
+    #[tokio::test]
     async fn responses_are_compressed_when_asked() {
         let s = state();
         let get = |encoding: Option<&str>| {

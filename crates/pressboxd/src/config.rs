@@ -372,6 +372,7 @@ mod tests {
             Config::parse("max_age_days = 0").is_err(),
             "zero days would delete everything"
         );
+        assert!(Config::parse("max_items_per_feed = 0").is_err());
     }
 
     #[test]

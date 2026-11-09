@@ -97,6 +97,8 @@ enum Command {
     },
 }
 
+// Not measured: process wiring around `run`, which the tests call.
+#[cfg(not(tarpaulin_include))]
 fn main() {
     if let Err(e) = run(Args::parse(), &mut std::io::stdout().lock()) {
         eprintln!("pressboxctl: {e:#}");
@@ -913,6 +915,34 @@ mod tests {
         let missing = ctl(&["opml-to-nix", "/nonexistent.opml"]).unwrap_err();
         assert!(format!("{missing:#}").starts_with("reading /nonexistent.opml"));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn names_odd_feeds() {
+        let opml = r#"<opml><body>
+            <outline title="!!!" xmlUrl="https://www.odd.example/feed"/>
+            <outline title="Blog" xmlUrl="https://a.example/feed"/>
+            <outline title="Blog" xmlUrl="https://b.example/feed"/>
+            <outline title="Blog" xmlUrl="https://c.example/feed"/>
+          </body></opml>"#;
+        let nix = opml_to_nix(opml).unwrap();
+        for line in ["odd-example = {", "blog = {", "blog-2 = {", "blog-3 = {"] {
+            assert!(nix.contains(line), "{line} in {nix}");
+        }
+        assert!(feed_links("<link>", "not a url").is_empty());
+        let untitled = Discovered {
+            url: "https://www.example.org/feed".into(),
+            title: Some("???".into()),
+            format: "RSS",
+        };
+        assert!(discovered_to_nix(&[untitled]).contains("example-org = {"));
+    }
+
+    #[test]
+    fn exports_the_only_users_opml() {
+        let socket = FakeSocket::new("opml", vec![(200, "<opml/>")]);
+        assert_eq!(socket.run(&["opml-export"]).unwrap(), "<opml/>");
+        assert_eq!(socket.request().0, "GET /admin/opml HTTP/1.1");
     }
 
     #[test]

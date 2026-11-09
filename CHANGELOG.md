@@ -31,6 +31,9 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
   runs when something was added or `maxAgeDays` is set.
 - `POST /api/v1/items/read-all` marks a whole list read in one request (any
   filters, search included), or only from a given item down.
+- A socket from systemd that isn't a TCP stream (`ListenDatagram=`, say) is
+  refused at startup with a clear message, instead of failing on the first
+  connection.
 
 ### Desktop client
 
@@ -41,6 +44,8 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
   other devices. Birdland colors, following the system's light or dark mode.
   Packaged with a desktop entry; Home Manager installs it with
   `programs.pressbox.desktop.enable`.
+- A server address that isn't one (`http://bad host`) is reported when you
+  press Pair.
 
 ### Terminal client
 

@@ -32,6 +32,8 @@ pub enum Screen {
 pub struct Setup {
     pub server: String,
     pub device: String,
+    /// The client pairing started with, once it has.
+    pub client: Option<Client>,
     /// The code to approve, once pairing has started.
     pub code: Option<String>,
     pub busy: bool,
@@ -68,6 +70,8 @@ pub struct Reader {
     pub approve_code: String,
     pub status: Option<String>,
     pub error: Option<String>,
+    /// Opens a link in the browser; tests swap it out.
+    open_url: fn(&str) -> std::io::Result<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,8 +118,15 @@ pub enum Message {
 }
 
 impl App {
+    // Not measured: reads the real user's config; tests use `boot_from`.
+    #[cfg(not(tarpaulin_include))]
     pub fn boot() -> (Self, Task<Message>) {
-        let config_path = ClientConfig::default_path();
+        Self::boot_from(ClientConfig::default_path())
+    }
+
+    /// Starts on the reader if `config_path` and its token say this machine
+    /// is paired, and on the pairing screen if not.
+    fn boot_from(config_path: Option<std::path::PathBuf>) -> (Self, Task<Message>) {
         let (config, session) = config::load_session(config_path.as_deref());
         let mut app = Self {
             screen: Screen::Setup(Setup::default()),
@@ -221,23 +232,19 @@ impl App {
                     setup.busy = true;
                     setup.error = None;
                     setup.code = None;
+                    setup.client = Some(client.clone());
                     Task::perform(
                         client.pair_start(setup.device.trim().to_owned()),
                         Message::PairStarted,
                     )
                 }
                 Message::PairStarted(Ok(start)) => {
+                    // A late answer for a pairing that was given up on.
+                    let Some(client) = setup.client.clone() else {
+                        return Task::none();
+                    };
                     setup.code = Some(start.code);
-                    match Client::new(&setup.server, None) {
-                        Ok(client) => {
-                            Task::perform(client.pair_wait(start.poll_id), Message::PairDone)
-                        }
-                        Err(e) => {
-                            setup.busy = false;
-                            setup.error = Some(e);
-                            Task::none()
-                        }
-                    }
+                    Task::perform(client.pair_wait(start.poll_id), Message::PairDone)
                 }
                 Message::PairStarted(Err(e)) | Message::PairDone(Err(e)) => {
                     setup.busy = false;
@@ -246,8 +253,11 @@ impl App {
                     Task::none()
                 }
                 Message::PairDone(Ok(approved)) => {
+                    let Some(client) = setup.client.take() else {
+                        return Task::none();
+                    };
                     let session = Session {
-                        server: api::normalize_server(&setup.server),
+                        server: client.server().to_owned(),
                         token: approved.token,
                     };
                     if let Err(e) =
@@ -257,15 +267,8 @@ impl App {
                         setup.error = Some(format!("Paired, but could not save the token: {e:#}"));
                         return Task::none();
                     }
-                    self.config.server = Some(session.server.clone());
-                    match Client::new(&session.server, Some(session.token)) {
-                        Ok(client) => self.open_reader(client),
-                        Err(e) => {
-                            setup.busy = false;
-                            setup.error = Some(e);
-                            Task::none()
-                        }
-                    }
+                    self.config.server = Some(session.server);
+                    self.open_reader(client.with_token(session.token))
                 }
                 _ => Task::none(),
             },
@@ -303,6 +306,7 @@ impl Reader {
             approve_code: String::new(),
             status: None,
             error: None,
+            open_url: open_in_browser,
         }
     }
 
@@ -551,7 +555,7 @@ impl Reader {
             Message::Flagged(_, _, _, Ok(())) => Task::none(),
             Message::OpenInBrowser => {
                 if let Some(url) = self.article.as_ref().and_then(|i| i.url.clone())
-                    && let Err(e) = open::that_detached(&url)
+                    && let Err(e) = (self.open_url)(&url)
                 {
                     self.error = Some(format!("could not open {url}: {e}"));
                 }
@@ -632,6 +636,13 @@ impl Reader {
     }
 }
 
+// Not measured: launches the user's browser. Tests give the reader their
+// own `open_url`.
+#[cfg(not(tarpaulin_include))]
+fn open_in_browser(url: &str) -> std::io::Result<()> {
+    open::that_detached(url)
+}
+
 fn load_feeds(client: &Client) -> Task<Message> {
     Task::perform(client.clone().feeds(), Message::FeedsLoaded)
 }
@@ -675,6 +686,7 @@ fn default_device_name() -> String {
 
 #[cfg(test)]
 mod tests {
+    use iced::Color;
     use pressbox_api::{Me, Version};
 
     use super::*;
@@ -932,6 +944,10 @@ mod tests {
             reader.feeds = vec![feed("a", 4, &[])];
         }
         assert_eq!(app.title(), "pressbox (4)");
+        if let Screen::Reader(reader) = &mut app.screen {
+            reader.feeds[0].unread = 0;
+        }
+        assert_eq!(app.title(), "pressbox", "no count when all is read");
 
         // Signing out forgets the token and goes back to pairing, with the
         // server filled in.
@@ -1033,6 +1049,284 @@ mod tests {
         assert!(r.article.is_none(), "nothing open, nothing toggled");
     }
 
+    /// Runs `task` until it has produced `n` messages (or fails the test
+    /// after five seconds), as the iced runtime would. Other actions (asking
+    /// the system for its theme, say) are left unanswered.
+    async fn run(task: Task<Message>, n: usize) -> Vec<Message> {
+        use iced_runtime::futures::futures::StreamExt;
+        let Some(stream) = iced_runtime::task::into_stream(task) else {
+            assert_eq!(n, 0, "the task does nothing");
+            return Vec::new();
+        };
+        let messages = stream
+            .filter_map(|action| async move {
+                match action {
+                    iced_runtime::Action::Output(message) => Some(message),
+                    _ => None,
+                }
+            })
+            .take(n)
+            .collect();
+        tokio::time::timeout(std::time::Duration::from_secs(5), messages)
+            .await
+            .expect("the task's messages")
+    }
+
+    const FEEDS: &str = r#"[
+        {"id":"a","title":"A","url":"https://a.example/","site_url":null,"tags":["t"],
+         "unread":1,"total":1,"last_fetched":null,"last_error":null,"archived":false},
+        {"id":"b","title":"B","url":"https://b.example/","site_url":null,"tags":[],
+         "unread":2,"total":2,"last_fetched":null,"last_error":null,"archived":false}]"#;
+    const ONE_PAGE: &str = r#"{"items":[{"id":7,"feed_id":"a","title":"Seven","url":"https://a.example/7",
+        "author":null,"summary":"<p>s</p>","published":0,"read":false,"starred":false}],
+        "next_cursor":"c7"}"#;
+    const ITEM: &str = r#"{"id":7,"feed_id":"a","title":"Seven","url":"https://a.example/7",
+        "author":null,"summary":"<p>s</p>","content":"<p>The whole of it.</p>","published":0,
+        "read":false,"starred":false}"#;
+
+    /// A server with everything the reader asks for.
+    fn reader_server() -> (String, std::sync::mpsc::Receiver<String>) {
+        crate::test_server::routed(vec![
+            (
+                "GET /api/v1/me",
+                200,
+                r#"{"user":"chris","admin":true,"device":"pc"}"#,
+            ),
+            ("GET /api/v1/version", 200, r#"{"version":"0.1.0","api":1}"#),
+            ("GET /api/v1/feeds", 200, FEEDS),
+            ("GET /api/v1/items/7", 200, ITEM),
+            ("GET /api/v1/items", 200, ONE_PAGE),
+            ("PUT /api/v1/items/7/", 204, ""),
+            ("POST /api/v1/feeds/", 200, r#"{"updated":1}"#),
+            ("POST /api/v1/refresh", 202, ""),
+            (
+                "POST /api/v1/pairings/",
+                200,
+                r#"{"name":"phone","user":"chris"}"#,
+            ),
+            (
+                "POST /api/v1/pair",
+                201,
+                r#"{"code":"K7W-4QX","poll_id":"p1","expires_in":600}"#,
+            ),
+            (
+                "GET /api/v1/pair/p1",
+                200,
+                r#"{"token":"new-token","name":"laptop"}"#,
+            ),
+        ])
+    }
+
+    /// Feeds each message back in, as the runtime does, and returns the
+    /// tasks that answers start.
+    fn answer(app: &mut App, messages: Vec<Message>) -> Vec<Task<Message>> {
+        messages.into_iter().map(|m| app.update(m)).collect()
+    }
+
+    fn reading(app: &App) -> &Reader {
+        match &app.screen {
+            Screen::Reader(r) => r,
+            Screen::Setup(_) => panic!("expected the reader"),
+        }
+    }
+
+    #[tokio::test]
+    async fn boots_into_the_reader_when_paired() {
+        let (base, _requests) = reader_server();
+        let dir = std::env::temp_dir().join(format!("pressbox-iced-boot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("client.json");
+        let token = dir.join("token");
+        std::fs::write(&token, "secret\n").unwrap();
+        std::fs::write(
+            &path,
+            format!(r#"{{"server":"{base}","tokenFile":"{}"}}"#, token.display()),
+        )
+        .unwrap();
+
+        let (mut app, task) = App::boot_from(Some(path.clone()));
+        let messages = run(task, 3).await;
+        assert!(
+            matches!(
+                &messages[..],
+                [
+                    Message::Identity(Ok(_)),
+                    Message::FeedsLoaded(Ok(_)),
+                    Message::ItemsLoaded(..)
+                ] | [
+                    Message::Identity(Ok(_)),
+                    Message::ItemsLoaded(..),
+                    Message::FeedsLoaded(Ok(_))
+                ] | [Message::FeedsLoaded(Ok(_)), ..]
+                    | [Message::ItemsLoaded(..), ..]
+            ),
+            "{messages:?}"
+        );
+        let _ = answer(&mut app, messages);
+        let reader = reading(&app);
+        assert_eq!(reader.me.as_ref().map(|m| m.user.as_str()), Some("chris"));
+        assert_eq!((reader.feeds.len(), reader.items.len()), (2, 1));
+        assert_eq!(app.title(), "pressbox (3)");
+        let _ = app.subscription();
+
+        // Without a token: the pairing screen, with the server filled in.
+        std::fs::remove_file(&token).unwrap();
+        let (app, _) = App::boot_from(Some(path));
+        assert!(matches!(&app.screen, Screen::Setup(s) if s.server == base));
+        let _ = app.subscription();
+        let (app, _) = App::boot_from(None);
+        assert!(matches!(&app.screen, Screen::Setup(s) if s.server.is_empty()));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pairs_through_the_server() {
+        let (base, requests) = reader_server();
+        let (mut app, dir) = setup_app("tasks");
+        let _ = app.update(Message::ServerChanged("http://bad host".into()));
+        let _ = app.update(Message::Pair);
+        assert!(
+            setup(&app)
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("not a server address")
+        );
+
+        // Answers for a pairing that isn't under way are ignored.
+        let started = PairStart {
+            code: "X".into(),
+            poll_id: "x".into(),
+            expires_in: 1,
+        };
+        let _ = app.update(Message::PairStarted(Ok(started)));
+        assert!(setup(&app).code.is_none());
+        let approved = PairApproved {
+            token: "t".into(),
+            name: "n".into(),
+        };
+        let _ = app.update(Message::PairDone(Ok(approved)));
+        assert!(matches!(app.screen, Screen::Setup(_)));
+        let _ = app.update(Message::Refresh);
+        assert!(
+            setup(&app).error.is_some(),
+            "reader messages change nothing here"
+        );
+
+        let _ = app.update(Message::ServerChanged(base.clone()));
+        let started = run(app.update(Message::Pair), 1).await;
+        let done = run(answer(&mut app, started).remove(0), 1).await;
+        assert_eq!(setup(&app).code.as_deref(), Some("K7W-4QX"));
+        let _ = answer(&mut app, done);
+        assert_eq!(reading(&app).client.server(), base);
+        assert_eq!(app.config.token().as_deref(), Some("new-token"));
+        let lines: Vec<String> = requests.try_iter().collect();
+        assert_eq!(lines, ["POST /api/v1/pair", "GET /api/v1/pair/p1"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_readers_tasks_talk_to_the_server() {
+        let (base, requests) = reader_server();
+        let mut r = Reader::new(Client::new(&base, Some("t".into())).unwrap());
+        let loaded = run(r.reload(), 1).await;
+        let _ = feed_reader(&mut r, loaded);
+        let feeds = run(load_feeds(&r.client), 1).await;
+        let _ = feed_reader(&mut r, feeds);
+        assert_eq!((r.items.len(), r.next_cursor.as_deref()), (1, Some("c7")));
+
+        // Opening an unread item fetches it and marks it read.
+        let opened = run(r.update(Message::OpenItem(7)), 2).await;
+        let _ = feed_reader(&mut r, opened);
+        let article = r.article.as_ref().unwrap();
+        assert!(article.read && r.article_text.contains("The whole of it."));
+        assert_eq!(r.feeds[0].unread, 0);
+        // A read item is only fetched.
+        assert_eq!(run(r.update(Message::OpenItem(7)), 1).await.len(), 1);
+
+        let starred = run(r.update(Message::Toggle(Flag::Starred)), 1).await;
+        assert!(matches!(
+            starred[..],
+            [Message::Flagged(7, Flag::Starred, true, Ok(()))]
+        ));
+        let _ = feed_reader(&mut r, starred);
+        let _ = r.update(Message::Toggle(Flag::Read));
+        assert!(!r.items[0].read, "marked unread again");
+
+        // Reaching the end loads the next page.
+        let more = run(r.update(Message::Next), 1).await;
+        assert!(matches!(more[..], [Message::ItemsLoaded(_, true, Ok(_))]));
+
+        // Mark all read covers every feed with unread items, or the one shown.
+        r.feeds[0].unread = 1;
+        let all = run(r.update(Message::MarkAllRead), 1).await;
+        assert!(
+            matches!(all[..], [Message::MarkedAllRead(Ok(2))]),
+            "{all:?}"
+        );
+        r.source = Source::Feed("a".into());
+        assert_eq!(r.source_title(), "A");
+        let one = run(r.update(Message::MarkAllRead), 1).await;
+        assert!(matches!(one[..], [Message::MarkedAllRead(Ok(1))]));
+
+        let _ = r.update(Message::ApproveCodeChanged("k7w-4qx".into()));
+        let approved = run(r.update(Message::Approve), 1).await;
+        assert!(matches!(&approved[..], [Message::Approved(Ok(a))] if a.name == "phone"));
+        let refreshed = run(r.update(Message::Refresh), 1).await;
+        assert!(matches!(refreshed[..], [Message::Refreshed(Ok(()))]));
+        assert_eq!(run(r.update(Message::Refreshed(Ok(()))), 2).await.len(), 2);
+
+        let seen: Vec<String> = requests.try_iter().collect();
+        for expected in [
+            "PUT /api/v1/items/7/read",
+            "PUT /api/v1/items/7/starred",
+            "GET /api/v1/items?unread=true&limit=50&cursor=c7",
+            "POST /api/v1/feeds/a/read-all",
+            "POST /api/v1/feeds/b/read-all",
+            "POST /api/v1/pairings/K7W-4QX/approve",
+            "POST /api/v1/refresh",
+        ] {
+            assert!(
+                seen.iter().any(|s| s.starts_with(expected)),
+                "{expected} in {seen:?}"
+            );
+        }
+    }
+
+    fn feed_reader(r: &mut Reader, messages: Vec<Message>) -> Vec<Task<Message>> {
+        messages.into_iter().map(|m| r.update(m)).collect()
+    }
+
+    #[test]
+    fn small_things() {
+        let mut r = reader();
+        r.items = vec![item(1, "a")];
+        r.source = Source::All;
+        assert_eq!(r.source_title(), "All items");
+        let _ = r.update(Message::Flagged(1, Flag::Read, true, Ok(())));
+        let _ = r.update(Message::Pair);
+        assert!(
+            r.error.is_none(),
+            "messages for the other screen are ignored"
+        );
+
+        // A link that can't be opened says so.
+        r.open_url = |_| Err(std::io::Error::other("no browser"));
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::OpenInBrowser);
+        assert_eq!(
+            r.error.as_deref(),
+            Some("could not open https://a.example/1: no browser")
+        );
+        r.open_url = |_| Ok(());
+        r.error = None;
+        let _ = r.update(Message::OpenInBrowser);
+        assert!(r.error.is_none());
+
+        assert_eq!(theme::rgb(0x12_34_56), Color::from_rgb8(0x12, 0x34, 0x56));
+    }
+
     #[test]
     fn keys() {
         use keyboard::{Key, Location, Modifiers, key::Named};
@@ -1065,5 +1359,19 @@ mod tests {
             "shortcuts pass"
         );
         assert!(on_key(press(char("x"), Modifiers::empty())).is_none());
+        assert!(matches!(
+            on_key(press(Key::Named(Named::Escape), Modifiers::empty())),
+            Some(Message::Dismiss)
+        ));
+        let release = keyboard::Event::KeyReleased {
+            key: char("j"),
+            modified_key: char("j"),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: Location::Standard,
+            modifiers: Modifiers::empty(),
+        };
+        assert!(on_key(release).is_none(), "only presses");
     }
 }

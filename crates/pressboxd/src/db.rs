@@ -676,21 +676,19 @@ impl Db {
                     None => {
                         inserted += 1;
                         let published = item.published.unwrap_or(now);
-                        let id = insert.query_row(
-                            params![
-                                source,
-                                item.guid,
-                                item.title,
-                                item.url,
-                                item.author,
-                                item.summary,
-                                item.content,
-                                published,
-                                digest,
-                                source_digest
-                            ],
-                            |r| r.get::<_, i64>(0),
-                        )?;
+                        let row = (
+                            source,
+                            &item.guid,
+                            &item.title,
+                            &item.url,
+                            &item.author,
+                            &item.summary,
+                            &item.content,
+                            published,
+                            &digest,
+                            source_digest,
+                        );
+                        let id = insert.query_row(row, |r| r.get::<_, i64>(0))?;
                         (id, None)
                     }
                     Some((id, stored_digest, published, stored_source)) => {
@@ -704,20 +702,18 @@ impl Db {
                         }
                         // The extracted article (if any) is kept, and stays
                         // what search sees.
-                        let article: Option<String> = update.query_row(
-                            params![
-                                id,
-                                item.title,
-                                item.url,
-                                item.author,
-                                item.summary,
-                                item.content,
-                                new_published,
-                                digest,
-                                source_digest
-                            ],
-                            |r| r.get(0),
-                        )?;
+                        let row = (
+                            id,
+                            &item.title,
+                            &item.url,
+                            &item.author,
+                            &item.summary,
+                            &item.content,
+                            new_published,
+                            &digest,
+                            source_digest,
+                        );
+                        let article: Option<String> = update.query_row(row, |r| r.get(0))?;
                         unindex.execute([id])?;
                         (id, article)
                     }
@@ -1121,6 +1117,13 @@ impl Db {
             .conn
             .execute("DELETE FROM devices WHERE name = ?1", [name])?
             > 0)
+    }
+
+    /// Runs SQL on the connection, for tests that need a broken database
+    /// (a dropped table, a trigger that fails writes) to reach error paths.
+    #[cfg(test)]
+    pub fn break_with(&self, sql: &str) {
+        self.conn.execute_batch(sql).unwrap();
     }
 
     /// Writes a consistent copy of the database to `path`.
@@ -2095,6 +2098,29 @@ mod tests {
     }
 
     #[test]
+    fn refuses_an_inconsistent_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in MIGRATIONS {
+            conn.execute_batch(sql).unwrap();
+        }
+        let current = i64::try_from(MIGRATIONS.len()).unwrap();
+        conn.pragma_update(None, "user_version", current).unwrap();
+        // State for an item that doesn't exist, as foreign keys allow
+        // while they are off.
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO users (id, name) VALUES (2, 'x');
+             INSERT INTO item_state (user_id, item_id, read) VALUES (2, 99, 1);",
+        )
+        .unwrap();
+        let error = Db::init(conn).err().unwrap();
+        assert_eq!(
+            error.to_string(),
+            "database is inconsistent after migrating (table item_state)"
+        );
+    }
+
+    #[test]
     fn refuses_a_newer_schema() {
         let conn = Connection::open_in_memory().unwrap();
         let newer = i64::try_from(MIGRATIONS.len()).unwrap() + 1;
@@ -2130,6 +2156,14 @@ mod tests {
             db.add_device(chris, "pc", "h9", 0).is_err(),
             "tokens are unique"
         );
+        // Every numbered name taken: give up rather than loop forever.
+        db.break_with(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 999)
+             INSERT INTO devices (name, token_hash, created, user_id)
+             SELECT CASE WHEN i = 1 THEN 'tv' ELSE 'tv-' || i END, 'tv' || i, 0, 1 FROM n;",
+        );
+        let error = db.add_device(chris, "tv", "fresh", 0).unwrap_err();
+        assert_eq!(error.to_string(), "too many devices named tv");
         assert_eq!(BadCursor.to_string(), "invalid cursor");
     }
 

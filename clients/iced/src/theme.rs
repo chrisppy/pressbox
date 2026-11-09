@@ -73,6 +73,6 @@ impl Colors {
     }
 }
 
-const fn rgb(hex: u32) -> Color {
+pub(crate) const fn rgb(hex: u32) -> Color {
     Color::from_rgb8((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }

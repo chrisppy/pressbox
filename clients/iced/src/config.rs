@@ -149,6 +149,11 @@ mod tests {
             ClientConfig::load(&dir.join("missing.json")).unwrap(),
             ClientConfig::default()
         );
+        let error = ClientConfig::load(&dir).unwrap_err();
+        assert!(format!("{error}").starts_with("reading "), "{error}");
+        if let Some(default) = ClientConfig::default_path() {
+            assert!(default.ends_with("pressbox/client.json"));
+        }
 
         let token = dir.join("token");
         write_private(&token, "abc\n").unwrap();

@@ -57,17 +57,33 @@ pub fn stopping() {
 /// The listening socket systemd passed in, if the service was socket
 /// activated. Only the first socket is used.
 pub fn listener() -> Result<Option<TcpListener>> {
-    let mut fds = sd_notify::listen_fds().context("reading LISTEN_FDS")?;
+    let fds = sd_notify::listen_fds().context("reading LISTEN_FDS")?;
+    // SAFETY: systemd hands these descriptors to us, nothing else in the
+    // process uses them, and `listen_fds` gives each out only this once.
+    unsafe { listener_from(fds) }
+}
+
+/// The first of the passed descriptors as a TCP listener.
+///
+/// # Safety
+///
+/// The descriptors must be open, owned by nobody else, and not used again
+/// by the caller: the first becomes the listener's, the rest are left alone.
+unsafe fn listener_from(
+    mut fds: impl ExactSizeIterator<Item = std::os::fd::RawFd>,
+) -> Result<Option<TcpListener>> {
     let Some(fd) = fds.next() else {
         return Ok(None);
     };
     if fds.len() > 0 {
         warn!("systemd passed more than one socket; using the first");
     }
-    // SAFETY: systemd hands this descriptor to us and nothing else in the
-    // process uses it; we take ownership exactly once.
+    // SAFETY: the caller hands over ownership of `fd`.
     let listener = unsafe { TcpListener::from_raw_fd(fd) };
-    if listener.local_addr().is_err() {
+    // A Unix socket has no IP address; a UDP one (ListenDatagram=) has one,
+    // but isn't a stream.
+    let stream = socket2::SockRef::from(&listener).r#type().ok() == Some(socket2::Type::STREAM);
+    if listener.local_addr().is_err() || !stream {
         bail!("socket from systemd is not a TCP socket; use ListenStream= with an address");
     }
     listener.set_nonblocking(true)?;
@@ -131,6 +147,51 @@ mod tests {
     use super::*;
     use crate::db::Db;
 
+    #[test]
+    fn takes_the_first_socket_systemd_passes() {
+        use std::os::fd::IntoRawFd;
+
+        let none: [std::os::fd::RawFd; 0] = [];
+        // SAFETY: there are no descriptors.
+        assert!(
+            unsafe { listener_from(none.into_iter()) }
+                .unwrap()
+                .is_none()
+        );
+
+        let tcp = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = tcp.local_addr().unwrap();
+        let spare = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fds = [
+            tcp.into_raw_fd(),
+            spare.as_fd().try_clone_to_owned().unwrap().into_raw_fd(),
+        ];
+        // SAFETY: both descriptors are ours and handed over here; the second
+        // is a duplicate that `listener_from` leaves open, closed below.
+        let listener = unsafe { listener_from(fds.into_iter()) }.unwrap().unwrap();
+        assert_eq!(listener.local_addr().unwrap(), address);
+        // SAFETY: the duplicate is ours and nothing else uses it.
+        drop(unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) });
+
+        // A UDP socket (say, ListenDatagram=) isn't something to serve on.
+        let udp = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .into_raw_fd();
+        // SAFETY: as above.
+        let error = unsafe { listener_from([udp].into_iter()) }.unwrap_err();
+        assert!(format!("{error}").contains("not a TCP socket"), "{error}");
+
+        // Nor is a Unix socket (ListenStream= with a path).
+        let path = std::env::temp_dir().join(format!("pressboxd-unix-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let unix = std::os::unix::net::UnixListener::bind(&path)
+            .unwrap()
+            .into_raw_fd();
+        // SAFETY: as above.
+        assert!(unsafe { listener_from([unix].into_iter()) }.is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[tokio::test]
     async fn watchdog_health_needs_a_responsive_database() {
         let state = Arc::new(AppState::new(Db::open_in_memory().unwrap(), None, 10).unwrap());
@@ -188,6 +249,9 @@ mod tests {
         assert_eq!(credential(TOKEN_CREDENTIAL), Some(dir.join("token")));
         assert!(credential("missing").is_none());
         assert!(!stderr_is_journal(), "1:2 is not our stderr");
+        // SAFETY: as above.
+        unsafe { std::env::set_var("JOURNAL_STREAM", "garbage") };
+        assert!(!stderr_is_journal());
         // SAFETY: as above.
         unsafe {
             std::env::remove_var("CREDENTIALS_DIRECTORY");
@@ -252,7 +316,33 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let state = Arc::new(AppState::new(Db::open_in_memory().unwrap(), None, 10).unwrap());
+            // Wedged (the writer lock held): no pings.
+            let wedged = state.clone();
+            let (held_tx, held) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            let holder = std::thread::spawn(move || {
+                let _guard = wedged.db();
+                held_tx.send(()).unwrap();
+                released.recv().unwrap();
+            });
+            held.recv().unwrap();
             spawn_watchdog(state);
+            // Waited for off the runtime, so the watchdog can run meanwhile.
+            let quiet = socket.try_clone().unwrap();
+            let pinged = tokio::task::spawn_blocking(move || {
+                quiet
+                    .set_read_timeout(Some(Duration::from_millis(300)))
+                    .unwrap();
+                quiet.recv(&mut [0; 64]).is_ok()
+            });
+            assert!(!pinged.await.unwrap(), "no ping while wedged");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+
+            // Answering again: pings resume.
+            release.send(()).unwrap();
+            holder.join().unwrap();
             let listener = socket.try_clone().unwrap();
             let ping = tokio::task::spawn_blocking(move || receive(&listener));
             assert_eq!(ping.await.unwrap(), "WATCHDOG=1\n");

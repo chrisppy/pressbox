@@ -23,10 +23,12 @@ test:
 lint:
     {{ cargo }} clippy --workspace --all-targets -- -D warnings
 
-# Line coverage per file (Linux). Built in target/tarpaulin so normal builds
-# stay cached; `just coverage --out Html` also writes target/coverage/tarpaulin-report.html
+# Line coverage per file, from LLVM's instrumentation (no extra toolchain
+# component). Built in target/tarpaulin so normal builds stay cached; `just
+# coverage --out Html` also writes target/coverage/tarpaulin-report.html.
+# Code marked `#[cfg(not(tarpaulin_include))]` isn't counted; each says why.
 coverage *args:
-    {{ cargo }} tarpaulin --workspace --engine ptrace --target-dir target/tarpaulin --output-dir target/coverage {{ args }}
+    {{ cargo }} tarpaulin --workspace --engine llvm --target-dir target/tarpaulin --output-dir target/coverage {{ args }}
 
 # Check advisories, licenses, duplicate crates and sources
 deny:

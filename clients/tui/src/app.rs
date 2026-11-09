@@ -245,9 +245,7 @@ impl App {
 
     /// Keys while the `/` search prompt is open.
     fn edit_search(&mut self, key: KeyCode, backend: &impl Backend) -> Result<()> {
-        let Some(text) = self.editing.as_mut() else {
-            return Ok(());
-        };
+        let text = self.editing.get_or_insert_default();
         match key {
             KeyCode::Char(c) => text.push(c),
             KeyCode::Backspace => {
@@ -404,14 +402,12 @@ impl App {
         self.mark(backend, true)
     }
 
-    /// Sets the read flag of the current item, locally and on the server.
+    /// Sets the read flag of the current item, locally and on the server,
+    /// unless it is already set that way.
     fn mark(&mut self, backend: &impl Backend, read: bool) -> Result<()> {
-        let Some(item) = self.current_item() else {
+        let Some(item) = self.current_item().filter(|i| i.read != read) else {
             return Ok(());
         };
-        if item.read == read {
-            return Ok(());
-        }
         let (id, feed_id) = (item.id, item.feed_id.clone());
         backend.set_read(id, read)?;
         self.update_item(id, |i| i.read = read);
@@ -510,6 +506,11 @@ mod tests {
     struct Fake {
         items: RefCell<Vec<Item>>,
         calls: RefCell<Vec<String>>,
+        /// Items per page, and whether pages continue by offset (an older
+        /// server) rather than cursor. All items on one page if `None`.
+        paging: std::cell::Cell<Option<(usize, bool)>>,
+        /// Item lists fail while set.
+        offline: std::cell::Cell<bool>,
     }
 
     fn item(id: i64, feed: &str) -> Item {
@@ -532,6 +533,8 @@ mod tests {
             Self {
                 items: RefCell::new(vec![item(1, "a"), item(2, "a"), item(3, "b")]),
                 calls: RefCell::default(),
+                paging: std::cell::Cell::new(None),
+                offline: std::cell::Cell::new(false),
             }
         }
     }
@@ -561,7 +564,10 @@ mod tests {
                 .collect())
         }
         fn items(&self, q: &ItemQuery) -> Result<ItemPage> {
-            let items = self
+            if self.offline.get() {
+                anyhow::bail!("offline");
+            }
+            let mut items: Vec<Item> = self
                 .items
                 .borrow()
                 .iter()
@@ -571,10 +577,30 @@ mod tests {
                 .filter(|i| q.q.as_ref().is_none_or(|s| i.title.contains(s.as_str())))
                 .cloned()
                 .collect();
+            let Some((size, offsets)) = self.paging.get() else {
+                return Ok(ItemPage {
+                    items,
+                    next_cursor: None,
+                    next_offset: None,
+                });
+            };
+            let start = match (&q.cursor, q.offset) {
+                (Some(after), _) => {
+                    1 + items
+                        .iter()
+                        .position(|i| i.id.to_string() == *after)
+                        .unwrap()
+                }
+                (None, offset) => offset.unwrap_or(0) as usize,
+            };
+            let mut page = items.split_off(start);
+            let more = page.len() > size;
+            page.truncate(size);
+            let end = (start + page.len()) as u32;
             Ok(ItemPage {
-                items,
-                next_cursor: None,
-                next_offset: None,
+                next_cursor: (more && !offsets).then(|| page.last().unwrap().id.to_string()),
+                next_offset: (more && offsets).then_some(end),
+                items: page,
             })
         }
         fn item(&self, id: i64) -> Result<Item> {
@@ -775,8 +801,19 @@ mod tests {
             "tags":[],"unread":1,"total":1,"last_fetched":null,"last_error":null,"archived":false}]"#;
         let page = r#"{"items":[{"id":7,"feed_id":"a","title":"Seven","url":null,"author":null,
             "summary":null,"published":0,"read":false,"starred":false}],"next_cursor":null}"#;
-        let (base, requests) =
-            crate::test_server::server(vec![(200, feeds), (200, page), (202, ""), (401, "{}")]);
+        let item = r#"{"id":7,"feed_id":"a","title":"Seven","url":null,"author":null,
+            "summary":null,"content":"<p>x</p>","published":0,"read":false,"starred":false}"#;
+        let (base, requests) = crate::test_server::server(vec![
+            (200, feeds),
+            (200, page),
+            (202, ""),
+            (200, item),
+            (204, ""),
+            (204, ""),
+            (200, r#"{"updated":2}"#),
+            (200, r#"{"updated":3}"#),
+            (401, "{}"),
+        ]);
         let client = Client::new(&base, Some("t".into())).unwrap();
         let mut app = App::new();
         app.reload(&client);
@@ -790,11 +827,19 @@ mod tests {
             "{}",
             app.status
         );
+        assert!(Backend::item(&client, 7).is_ok());
+        Backend::set_read(&client, 7, true).unwrap();
+        Backend::set_starred(&client, 7, true).unwrap();
+        assert_eq!(Backend::mark_feed_read(&client, "a").unwrap(), 2);
+        assert_eq!(
+            Backend::mark_read(&client, &MarkRead::default()).unwrap(),
+            3
+        );
         app.reload(&client);
         assert_eq!(app.status, "error: the server rejected the token (401)");
         let paths: Vec<String> = requests
             .iter()
-            .take(4)
+            .take(9)
             .map(|h| h.split(' ').nth(1).unwrap().to_owned())
             .collect();
         assert_eq!(
@@ -803,9 +848,114 @@ mod tests {
                 "/api/v1/feeds",
                 "/api/v1/items?unread=true&limit=100",
                 "/api/v1/refresh",
+                "/api/v1/items/7",
+                "/api/v1/items/7/read",
+                "/api/v1/items/7/starred",
+                "/api/v1/feeds/a/read-all",
+                "/api/v1/items/read-all",
                 "/api/v1/feeds"
             ]
         );
+    }
+
+    #[test]
+    fn pages_in_as_you_scroll_and_keeps_its_place_on_errors() {
+        for offsets in [false, true] {
+            let fake = Fake::new();
+            fake.paging.set(Some((1, offsets)));
+            let mut app = App::new();
+            app.reload(&fake);
+            let more = if offsets {
+                NextPage::Offset(1)
+            } else {
+                NextPage::Cursor("1".into())
+            };
+            assert_eq!(
+                (app.items.len(), app.next_page.clone()),
+                (1, Some(more.clone()))
+            );
+
+            // Near the end of the list, the next page loads.
+            keys(&mut app, &fake, "\n");
+            fake.offline.set(true);
+            keys(&mut app, &fake, "j");
+            assert_eq!(app.status, "error: offline");
+            assert_eq!(app.next_page, Some(more), "tried again next time");
+            fake.offline.set(false);
+            keys(&mut app, &fake, "jj");
+            assert_eq!(
+                app.items.iter().map(|i| i.id).collect::<Vec<_>>(),
+                [1, 2, 3]
+            );
+            assert_eq!(app.next_page, None);
+        }
+    }
+
+    #[test]
+    fn moves_scrolls_and_ignores_what_it_cant_do() {
+        let fake = Fake::new();
+        let mut app = App::new();
+        // Nothing loaded: nothing to open, mark or star.
+        keys(&mut app, &fake, "\nlmsoM");
+        assert!(fake.calls.borrow().is_empty());
+        assert!(app.reader.is_none());
+
+        app.reload(&fake);
+        keys(&mut app, &fake, "z");
+        assert_eq!(app.status, "", "unknown keys do nothing");
+        keys(&mut app, &fake, "r");
+        assert_eq!(app.status, "reloaded");
+
+        // Page keys move ten at a time, within the list.
+        let page = |app: &mut App, key| app.handle(key, &fake);
+        assert_eq!(app.focus, Pane::Items);
+        let _ = page(&mut app, KeyCode::PageDown);
+        assert_eq!(app.item_row, 2);
+        let _ = page(&mut app, KeyCode::PageUp);
+        assert_eq!(app.item_row, 0);
+        keys(&mut app, &fake, " ");
+        assert_eq!(app.item_row, 2);
+
+        // Tab opens the reader; there, keys scroll and Enter/Tab stay put.
+        let _ = page(&mut app, KeyCode::Tab);
+        assert_eq!(app.focus, Pane::Reader);
+        keys(&mut app, &fake, "jj\nl");
+        assert_eq!(app.reader.as_ref().unwrap().scroll, 2);
+        keys(&mut app, &fake, "k");
+        assert_eq!(app.reader.as_ref().unwrap().scroll, 1);
+        // `o` on an item already read doesn't mark it again.
+        let calls = fake.calls.borrow().len();
+        let _ = app.handle(KeyCode::Char('o'), &fake);
+        assert_eq!(fake.calls.borrow().len(), calls);
+
+        // M in the reader covers the open item too.
+        keys(&mut app, &fake, "<k");
+        fake.set_read(3, false).unwrap();
+        app.items[2].read = false;
+        let _ = page(&mut app, KeyCode::Tab);
+        keys(&mut app, &fake, "m");
+        assert!(!app.reader.as_ref().unwrap().item.read);
+        keys(&mut app, &fake, "M");
+        assert!(app.reader.as_ref().unwrap().item.read);
+
+        // A on "All items" marks every feed with unread items.
+        keys(&mut app, &fake, "<<hkkk");
+        assert_eq!(app.feed_row, ALL_ROW);
+        fake.set_read(1, false).unwrap();
+        app.reload(&fake);
+        keys(&mut app, &fake, "A");
+        assert_eq!(fake.calls.borrow().last().unwrap(), "read-all a");
+
+        // A in the starred list does nothing; Tab in the search prompt
+        // is ignored.
+        keys(&mut app, &fake, "<<hkkj");
+        assert_eq!(app.feed_row, STARRED_ROW);
+        let calls = fake.calls.borrow().len();
+        keys(&mut app, &fake, "A");
+        assert_eq!(fake.calls.borrow().len(), calls);
+        keys(&mut app, &fake, "/x");
+        let _ = page(&mut app, KeyCode::Tab);
+        assert_eq!(app.editing.as_deref(), Some("x"));
     }
 
     #[test]

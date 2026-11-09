@@ -123,7 +123,7 @@ just fmt             # devfmt's treefmt setup
 just deny            # advisories, licenses, duplicate crates, sources
 just check           # nix flake check: builds, module checks, NixOS VM test
 just verify          # all of the above, as CI does
-just coverage        # line coverage per file (cargo-tarpaulin, Linux)
+just coverage        # line coverage per file (cargo-tarpaulin); 100% is the bar
 ```
 
 `cargo deny` also runs in CI on every push and weekly, so a new advisory against

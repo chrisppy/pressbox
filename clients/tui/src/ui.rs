@@ -326,6 +326,14 @@ mod tests {
         }
         app.reader.as_mut().unwrap().item.starred = true;
         assert!(contains(&screen(&app, 100, 24), " Reader ★ "));
+        let reader = app.reader.as_mut().unwrap();
+        (reader.item.starred, reader.item.read) = (false, true);
+        let rows = screen(&app, 100, 24);
+        let title = rows.iter().find(|r| r.contains(" Reader")).unwrap();
+        assert!(
+            !title.contains("unread") && !title.contains('★'),
+            "nothing to flag: {title}"
+        );
     }
 
     #[test]

@@ -467,6 +467,13 @@ mod tests {
         let _listener = bind(&path).unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+
+        // Something that isn't a stale socket is left alone.
+        let occupied = dir.join("occupied");
+        std::fs::create_dir_all(occupied.join("inside")).unwrap();
+        let error = bind(&occupied).unwrap_err();
+        assert!(format!("{error}").starts_with("removing stale"), "{error}");
+        assert!(occupied.join("inside").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

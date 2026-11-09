@@ -778,15 +778,17 @@ mod tests {
     async fn bodies_are_limited_without_content_length() {
         use axum::{Router, body::Body, routing::get};
         // Streamed in chunks, so there is no Content-Length to check first.
-        let app = Router::new().route(
-            "/{n}",
-            get(
-                |axum::extract::Path(n): axum::extract::Path<usize>| async move {
-                    let chunks = (0..n).map(|_| Ok::<_, std::io::Error>(vec![b'x'; 1000]));
-                    Body::from_stream(futures::stream::iter(chunks))
-                },
-            ),
-        );
+        let app = Router::new()
+            .route("/sized", get(|| async { vec![b'x'; 6000] }))
+            .route(
+                "/{n}",
+                get(
+                    |axum::extract::Path(n): axum::extract::Path<usize>| async move {
+                        let chunks = (0..n).map(|_| Ok::<_, std::io::Error>(vec![b'x'; 1000]));
+                        Body::from_stream(futures::stream::iter(chunks))
+                    },
+                ),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await });
@@ -800,6 +802,17 @@ mod tests {
             }
         };
         assert_eq!(get(5).await.unwrap().len(), 5000);
+        // With a Content-Length, a large body is refused before reading it.
+        let sized = http
+            .get(format!("http://{addr}/sized"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(sized.content_length(), Some(6000));
+        assert_eq!(
+            read_limited(sized, 5000, "page").await.unwrap_err(),
+            "page is larger than 5000 bytes"
+        );
         assert_eq!(
             get(1000).await.unwrap_err(),
             "body is larger than 5000 bytes"
@@ -850,7 +863,9 @@ mod tests {
                         )
                             .into_response()
                     } else {
-                        ([(header::ETAG, "\"v1\"")], rss).into_response()
+                        let modified = "Tue, 03 Nov 2026 10:00:00 GMT";
+                        let headers = [(header::ETAG, "\"v1\""), (header::LAST_MODIFIED, modified)];
+                        (headers, rss).into_response()
                     }
                 }),
             )
@@ -986,13 +1001,88 @@ mod tests {
         // Second pass: 304 keeps the ETag and honours max-age; the 503
         // backs off again.
         state.request_refresh().await;
+        let second = now();
         let stats = run_due(state.clone(), 1800).await.unwrap();
         assert_eq!((stats.fetched, stats.failed, stats.new_items), (3, 2, 0));
         let ok = target("feed");
         assert_eq!((ok.etag.as_deref(), ok.fail_count), (Some("\"v1\""), 0));
         assert_eq!(target("down").fail_count, 2);
-        let due: Vec<_> = state.reader().due_targets(now() + 7199, 1800).unwrap();
+        let due: Vec<_> = state.reader().due_targets(second + 7199, 1800).unwrap();
         assert!(!due.iter().any(|t| t.url == ok.url), "max-age=7200 waits");
+    }
+
+    /// A state following `feed_server`'s feed with full text on.
+    fn local_state(addr: std::net::SocketAddr) -> Arc<AppState> {
+        let config = format!("[feeds.ok]\nurl = \"http://{addr}/feed\"\nfull_text = true");
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        db.sync(&crate::config::Config::parse(&config).unwrap())
+            .unwrap();
+        let mut state = AppState::new(db, None, 100).unwrap();
+        state.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        Arc::new(state)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn database_failures_are_logged_not_fatal() {
+        let addr = feed_server().await;
+        let feed = format!("http://{addr}/feed");
+
+        // Can't store what was fetched: the feed counts as failed.
+        let state = local_state(addr);
+        state.db().break_with(
+            "CREATE TRIGGER full BEFORE INSERT ON items
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        );
+        let stats = run_due(state.clone(), 1800).await.unwrap();
+        assert_eq!((stats.fetched, stats.failed, stats.new_items), (1, 1, 0));
+
+        // Can't store an article: logged, and left to try again.
+        let state = local_state(addr);
+        let post = NewItem {
+            guid: "p".into(),
+            title: "Post".into(),
+            url: Some(format!("http://{addr}/post")),
+            author: None,
+            summary: None,
+            content: None,
+            published: Some(1),
+        };
+        state.db().upsert_items(&feed, 0, &[post]).unwrap();
+        state.db().break_with(
+            "CREATE TRIGGER no_articles BEFORE UPDATE OF full_content ON items
+             BEGIN SELECT RAISE(ABORT, 'read-only'); END;",
+        );
+        fetch_articles(&state, &feed).await;
+        let pending = state.reader().full_text_pending(&feed, 10).unwrap();
+        assert_eq!(pending.len(), 1);
+
+        // Can't even list what to do: nothing happens.
+        state.db().break_with("DROP TABLE items;");
+        fetch_articles(&state, &feed).await;
+        state.db().break_with("DROP TABLE subscriptions;");
+        assert_eq!(run_due(state.clone(), 1800).await, None);
+    }
+
+    #[tokio::test]
+    async fn one_article_task_per_feed() {
+        let state = local_state("127.0.0.1:9".parse().unwrap());
+        let running = || state.articles_running.lock().unwrap().len();
+        // Already running for this feed: nothing new starts.
+        state.articles_running.lock().unwrap().insert("f".into());
+        spawn_articles(&state, "f".into());
+        assert_eq!(running(), 1);
+        state.articles_running.lock().unwrap().clear();
+
+        // Shutting down (no slots left): the task ends and forgets the feed.
+        state.article_slots.close();
+        spawn_articles(&state, "g".into());
+        for _ in 0..100 {
+            if running() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the task didn't finish");
     }
 
     #[test]

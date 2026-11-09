@@ -27,17 +27,26 @@ pub struct Client {
 }
 
 impl Client {
+    /// A client for `server` (`https://` is assumed without a scheme).
+    /// Fails if that isn't a usable address.
     pub fn new(server: &str, token: Option<String>) -> Result<Self> {
+        let base = normalize_server(server);
+        reqwest::Url::parse(&base)
+            .map_err(|e| format!("{server:?} is not a server address: {e}"))?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .user_agent(concat!("pressbox-iced/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|e| e.to_string())?;
-        Ok(Self {
-            http,
-            base: normalize_server(server),
-            token,
-        })
+        Ok(Self { http, base, token })
+    }
+
+    /// The same server, with a token.
+    pub fn with_token(&self, token: String) -> Self {
+        Self {
+            token: Some(token),
+            ..self.clone()
+        }
     }
 
     pub fn server(&self) -> &str {
@@ -284,6 +293,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rejects_bad_addresses_and_describes_failures() {
+        let error = Client::new("http://bad host", None).unwrap_err();
+        assert!(
+            error.starts_with("\"http://bad host\" is not a server address"),
+            "{error}"
+        );
+        let client = Client::new("rss.example", None)
+            .unwrap()
+            .with_token("t".into());
+        assert_eq!(
+            (client.server(), client.token.as_deref()),
+            ("https://rss.example", Some("t"))
+        );
+
+        // Connects, but never answers.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let impatient = reqwest::Client::builder()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .unwrap();
+        let url = format!("http://{}/", silent.local_addr().unwrap());
+        let timeout = impatient.get(&url).send().await.unwrap_err();
+        assert_eq!(describe(timeout), "the server did not answer in time");
+        let other = impatient
+            .get("http://[::1]:99999/")
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!describe(other).is_empty());
+    }
+
+    #[tokio::test]
     async fn pairs_and_approves() {
         let (base, requests) = server(vec![
             (201, r#"{"code":"K7W-4QX","poll_id":"p1","expires_in":600}"#),
@@ -295,6 +336,10 @@ mod tests {
         let client = Client::new(&base, None).unwrap();
         let start = client.clone().pair_start("laptop".into()).await.unwrap();
         assert_eq!(start.code, "K7W-4QX");
+        // Approved before the first poll: no waiting.
+        let (base2, _requests2) = server(vec![(200, r#"{"token":"s","name":"n"}"#)]);
+        let quick = Client::new(&base2, None).unwrap();
+        assert_eq!(quick.pair_wait("p0".into()).await.unwrap().token, "s");
         let wait = |c: &Client| c.clone().pair_wait_every("p1".into(), Duration::ZERO);
         assert_eq!(wait(&client).await.unwrap().token, "secret");
         assert_eq!(

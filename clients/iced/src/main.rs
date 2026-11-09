@@ -11,6 +11,9 @@ mod test_server;
 mod theme;
 mod ui;
 
+// Not measured: opens a window; the app's state, views and tasks are
+// tested without one.
+#[cfg(not(tarpaulin_include))]
 fn main() -> iced::Result {
     iced::application(app::App::boot, app::App::update, ui::view)
         .title(app::App::title)

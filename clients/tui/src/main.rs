@@ -58,6 +58,8 @@ enum Command {
     Whoami,
 }
 
+// Not measured: process wiring around `run`.
+#[cfg(not(tarpaulin_include))]
 fn main() {
     if let Err(e) = run(Args::parse()) {
         eprintln!("pressbox: {e:#}");
@@ -201,6 +203,9 @@ fn approve(
     Ok(())
 }
 
+// Not measured: reads the real config and token and takes over the
+// terminal; the commands and app it drives are tested on their own.
+#[cfg(not(tarpaulin_include))]
 fn run(args: Args) -> Result<()> {
     let config = match args.config.or_else(ClientConfig::default_path) {
         Some(path) => ClientConfig::load(&path)?,
@@ -239,18 +244,21 @@ fn run(args: Args) -> Result<()> {
             match app.handle(key.code, &client) {
                 Action::None => {}
                 Action::Quit => return Ok(()),
-                Action::Open(url) => open(&url, &mut app),
+                Action::Open(url) => open(OPENER, &url, &mut app),
             }
         }
     })
 }
 
-fn open(url: &str, app: &mut App) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
+/// What opens a link in the browser.
+const OPENER: &str = if cfg!(target_os = "macos") {
+    "open"
+} else {
+    "xdg-open"
+};
+
+/// Opens `url` with `opener` without waiting, and says so in the status line.
+fn open(opener: &str, url: &str, app: &mut App) {
     let spawned = process::Command::new(opener)
         .arg(url)
         .stdin(std::process::Stdio::null())
@@ -344,6 +352,35 @@ mod tests {
             "{error:#}"
         );
         assert!(!token.exists());
+    }
+
+    #[test]
+    fn an_unapproved_code_expires() {
+        let (base, _requests) = server(vec![(
+            201,
+            r#"{"code":"K7W-4QX","poll_id":"p1","expires_in":0}"#,
+        )]);
+        let token = temp_dir("expired").join("token");
+        let error = pair(&base, &token, None, Duration::ZERO, &mut Vec::new()).unwrap_err();
+        assert!(
+            format!("{error:#}").starts_with("the code expired"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn opens_links_and_says_when_it_cant() {
+        let mut app = App::new();
+        open("true", "https://example.com/1", &mut app);
+        assert_eq!(app.status, "opened https://example.com/1");
+        open("/nonexistent/opener", "https://example.com/1", &mut app);
+        assert!(
+            app.status
+                .starts_with("error: could not run /nonexistent/opener"),
+            "{}",
+            app.status
+        );
+        assert!(!hostname().is_empty());
     }
 
     #[test]
