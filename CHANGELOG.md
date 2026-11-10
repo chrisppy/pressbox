@@ -44,8 +44,8 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
   other devices. Birdland colors, following the system's light or dark mode.
   Packaged with a desktop entry; Home Manager installs it with
   `programs.pressbox.desktop.enable`.
-- A server address that isn't one (`http://bad host`) is reported when you
-  press Pair.
+- A server address that isn't one (`http://bad host`) is reported when you press
+  Pair.
 
 ### Terminal client
 
