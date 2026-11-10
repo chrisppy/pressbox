@@ -48,9 +48,9 @@ ignore = [
   # with catch_unwind; cryoglyph's glyph keys are plain data.
   { id = "RUSTSEC-2026-0253", reason = "lru, via cryoglyph (iced's glyph cache); keys can't panic on drop" },
 ]
-yanked = "deny"
 unmaintained = "all"
 unsound = "all"
+yanked = "deny"
 
 [bans]
 multiple-versions = "warn"
