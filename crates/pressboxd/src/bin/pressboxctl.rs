@@ -676,13 +676,16 @@ mod tests {
     }
 
     impl FakeSocket {
+        /// Lives in its own directory, which it deletes when dropped, so
+        /// `name` must be unique among the tests (and its own prefix keeps
+        /// it apart from other tests' directories).
         fn new(name: &str, responses: Vec<(u16, &str)>) -> Self {
             let responses: Vec<(u16, String)> = responses
                 .into_iter()
                 .map(|(status, body)| (status, body.to_owned()))
                 .collect();
-            let dir =
-                std::env::temp_dir().join(format!("pressboxctl-{name}-{}", std::process::id()));
+            let dir = std::env::temp_dir()
+                .join(format!("pressboxctl-socket-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
             let path = dir.join("control.sock");
@@ -940,7 +943,7 @@ mod tests {
 
     #[test]
     fn exports_the_only_users_opml() {
-        let socket = FakeSocket::new("opml", vec![(200, "<opml/>")]);
+        let socket = FakeSocket::new("opml-export", vec![(200, "<opml/>")]);
         assert_eq!(socket.run(&["opml-export"]).unwrap(), "<opml/>");
         assert_eq!(socket.request().0, "GET /admin/opml HTTP/1.1");
     }
