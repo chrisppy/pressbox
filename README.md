@@ -121,6 +121,7 @@ just test            # cargo test
 just lint            # clippy, warnings as errors
 just fmt             # devfmt's treefmt setup
 just deny            # advisories, licenses, duplicate crates, sources
+just audit           # security advisories only
 just check           # nix flake check: builds, module checks, NixOS VM test,
                      # coverage
 just verify          # all of the above, as CI does

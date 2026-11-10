@@ -35,6 +35,11 @@ coverage *args:
 deny:
     {{ cargo }} deny check
 
+# Check only for security advisories (RustSec): vulnerable, unsound,
+# unmaintained or yanked crates, as `cargo audit` would
+audit:
+    {{ cargo }} deny check advisories
+
 # Time the database on 100k items (not a test)
 bench:
     {{ cargo }} test --release -p pressboxd bench -- --ignored --nocapture

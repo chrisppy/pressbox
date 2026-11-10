@@ -31,8 +31,10 @@ confidence-threshold = 0.9
 ignore = true
 
 [advisories]
-# Every RustSec advisory fails, including unmaintained crates and yanked
-# versions, unless listed in `ignore` with a reason.
+# Every RustSec advisory fails, including unmaintained and unsound crates
+# however deep in the tree (cargo-deny only reports unsound ones you depend
+# on directly unless told) and yanked versions, unless listed in `ignore`
+# with a reason. So this covers what `cargo audit` reports.
 ignore = [
   # Unmaintained, no replacement yet; all come in through iced 0.14 for
   # pressbox-iced only. Drop each once an iced release moves off it.
@@ -41,8 +43,14 @@ ignore = [
   { id = "RUSTSEC-2026-0370", reason = "zvariant, folded into zbus; via mundy (dark mode)" },
   { id = "RUSTSEC-2026-0371", reason = "zbus_names, folded into zbus; via mundy (dark mode)" },
   { id = "RUSTSEC-2026-0372", reason = "zvariant_derive, folded into zbus; via mundy (dark mode)" },
+  # Unsound, fixed only in lru 0.18; iced 0.14's text renderer (cryoglyph,
+  # one release so far) is on 0.16. Needs a key whose Drop panics, caught
+  # with catch_unwind; cryoglyph's glyph keys are plain data.
+  { id = "RUSTSEC-2026-0253", reason = "lru, via cryoglyph (iced's glyph cache); keys can't panic on drop" },
 ]
 yanked = "deny"
+unmaintained = "all"
+unsound = "all"
 
 [bans]
 multiple-versions = "warn"
