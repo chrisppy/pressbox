@@ -8,9 +8,10 @@ SPDX-License-Identifier: GPL-3.0-only
 # pressbox
 
 A self-hosted RSS/Atom/JSON Feed aggregator. You declare feeds (and the people
-using them) in your NixOS configuration, a small Rust server polls them, and a
-terminal client on NixOS and an
-[iOS app](https://github.com/chrisppy/pressbox-ios) share read and starred state
+using them) in your NixOS configuration, a small Rust server polls them, and
+terminal and desktop clients on NixOS, an [iPhone, iPad and Mac
+app](https://github.com/chrisppy/pressbox-darwin) and an [Android
+app](https://github.com/chrisppy/pressbox-android) share read and starred state
 through its API. Each client is paired with a short code; there is no website
 and no shared secret. [Birdland](https://github.com/chrisppy/birdland)'s bar can
 show the unread count.
@@ -23,7 +24,7 @@ show the unread count.
 NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items, search index, devices)
 (services.pressbox.feeds)            │ HTTP API, one token per device
                    ┌───────────────┼────────────────┐
-             TUI, desktop    Birdland bar        iOS app
+             TUI, desktop    Birdland bar    Apple, Android apps
                            pressboxctl (control socket, on the server)
 ```
 
@@ -34,7 +35,8 @@ NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items
 | `pressbox-api` | `crates/pressbox-api` | JSON types shared by the Rust crates |
 | `pressbox` | `clients/tui` | Terminal client (ratatui) |
 | `pressbox-iced` | `clients/iced` | Desktop client (iced) |
-| iOS app | [pressbox-ios](https://github.com/chrisppy/pressbox-ios) | SwiftUI client, in its own repo |
+| Apple app | [pressbox-darwin](https://github.com/chrisppy/pressbox-darwin) | SwiftUI client (iPhone, iPad, Mac), in its own repo |
+| Android app | [pressbox-android](https://github.com/chrisppy/pressbox-android) | Jetpack Compose client, in its own repo |
 | NixOS module | `modules/nixos.nix` | `services.pressbox` |
 | Home Manager module | `modules/home-manager.nix` | `programs.pressbox` |
 
@@ -48,12 +50,16 @@ NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items
   and the Birdland bar
 - [API](./docs/api.md): the HTTP API clients use
 
-## iOS
+## Apple and Android apps
 
-The iOS app is in its own repo,
-[pressbox-ios](https://github.com/chrisppy/pressbox-ios), with its own releases.
-It needs iOS 18 and talks to the server through API v1; see its README for
-building it and what it can do.
+The mobile and Mac apps are in their own repos, with their own releases, and
+talk to the server through API v1; see their READMEs for building them and what
+they can do.
+
+- [pressbox-darwin](https://github.com/chrisppy/pressbox-darwin) (formerly
+  pressbox-ios): iPhone and iPad on iOS 18, and Mac on macOS 15.
+- [pressbox-android](https://github.com/chrisppy/pressbox-android): Android 12
+  or later.
 
 ## Project layout
 
@@ -163,8 +169,11 @@ license in an SPDX header (`reuse lint` checks this, also in `nix flake check`).
 - The logo (`assets/logo.svg`) is licensed under
   [Creative Commons Attribution-ShareAlike 4.0](LICENSES/CC-BY-SA-4.0.txt).
 
-The iOS app, [pressbox-ios](https://github.com/chrisppy/pressbox-ios), is
-licensed separately, under the Mozilla Public License 2.0.
+The apps are licensed separately:
+[pressbox-darwin](https://github.com/chrisppy/pressbox-darwin) under the Mozilla
+Public License 2.0, and
+[pressbox-android](https://github.com/chrisppy/pressbox-android) under the GPL
+v3.0 only, like pressbox.
 
 ### Name and logo
 

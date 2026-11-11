@@ -101,7 +101,7 @@ fn pair(
     )?;
     writeln!(
         out,
-        "or from a paired device (`pressbox approve {code}`, or the iOS app)."
+        "or from a paired device (`pressbox approve {code}`, or the Apple or Android app)."
     )?;
     out.flush()?;
     let deadline = std::time::Instant::now() + Duration::from_secs(start.expires_in);

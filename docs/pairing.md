@@ -8,12 +8,13 @@ SPDX-License-Identifier: GPL-3.0-only
 Every client gets its own token, and only its SHA-256 is stored. To pair:
 
 1. On the new client, start pairing: `pressbox pair`, or "Pair this device" in
-   the iOS app. It shows a code like `K7W-4QX`.
+   the Apple or Android app. It shows a code like `K7W-4QX`.
 1. Approve it on the server with `sudo pressboxctl approve K7W-4QX --user anna`
    (`--user` is needed once there is more than one user), or from a client that
-   is already paired: `pressbox approve K7W-4QX`, or iOS Settings. A device
-   approved from a client goes to that client's user; admins can name another
-   (`pressbox approve CODE --user anna`, or the user field in iOS Settings).
+   is already paired: `pressbox approve K7W-4QX`, or Settings in the apps. A
+   device approved from a client goes to that client's user; admins can name
+   another (`pressbox approve CODE --user anna`, or the user field in the apps'
+   Settings).
 1. The client picks up its token on its own. Codes expire after ten minutes.
 
 `pressboxctl devices` lists devices with their user and when each was last seen;
