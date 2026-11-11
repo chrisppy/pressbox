@@ -51,14 +51,16 @@ _: {
         pkgs.gst_all_1.gstreamer
         pkgs.gst_all_1.gst-plugins-base
       ];
-      gstPlugins = gstLibs ++ [
-        pkgs.gst_all_1.gst-plugins-good
-        pkgs.gst_all_1.gst-plugins-bad
-        pkgs.gst_all_1.gst-libav
-      ]
-      # PipeWire's own sink, so autoaudiosink can play straight to PipeWire
-      # rather than through its PulseAudio shim.
-      ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.pipewire;
+      gstPlugins =
+        gstLibs
+        ++ [
+          pkgs.gst_all_1.gst-plugins-good
+          pkgs.gst_all_1.gst-plugins-bad
+          pkgs.gst_all_1.gst-libav
+        ]
+        # PipeWire's own sink, so autoaudiosink can play straight to PipeWire
+        # rather than through its PulseAudio shim.
+        ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.pipewire;
       gstPluginPath = lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins;
       # What building (and testing) pressbox-iced needs.
       gstBuild = {

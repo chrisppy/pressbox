@@ -37,7 +37,7 @@ in
     player = mkOption {
       type = types.nullOr types.str;
       default = null;
-      example = lib.literalExpression ''lib.getExe pkgs.mpv'';
+      example = lib.literalExpression "lib.getExe pkgs.mpv";
       description = ''
         The mpv the terminal client plays podcasts with. Leave unset to use
         `mpv` from the `PATH`.

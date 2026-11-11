@@ -33,7 +33,7 @@ and `tui.enable = false` to leave out the terminal one.
 requests, and `pressbox whoami` shows the signed-in user and device.
 
 | Key | Action |
-| --------------------- | -------------------------------------------- |
+| --------------------- | --------------------------------------------- |
 | `j` `k` / arrows | Move (scrolls in the reader) |
 | `Enter` / `l` / `Tab` | Open feed → item list → reader |
 | `Esc` / `h` | Back (clears a search first) |
@@ -56,14 +56,14 @@ requests, and `pressbox whoami` shows the signed-in user and device.
 
 Podcast episodes (items with audio or video) are marked `♪` in the list, `◐`
 once started and `▶` while playing. They play in [mpv](https://mpv.io), which
-must be installed (or set `player` in `client.json`, or `programs.pressbox.player`
-in Home Manager): audio plays in the background, video in mpv's window. The
-line above the status shows the time, chapter and speed. The position is saved
-on the server every 15 seconds, on pause and on stop, so playing resumes where
-you left off on any client; an episode played to the end (or stopped in its
-last 30 seconds) is marked read. Opening an episode doesn't mark it read. The
-reader lists its chapters, the current one highlighted while it plays, and `t`
-swaps the text for the transcript.
+must be installed (or set `player` in `client.json`, or
+`programs.pressbox.player` in Home Manager): audio plays in the background,
+video in mpv's window. The line above the status shows the time, chapter and
+speed. The position is saved on the server every 15 seconds, on pause and on
+stop, so playing resumes where you left off on any client; an episode played to
+the end (or stopped in its last 30 seconds) is marked read. Opening an episode
+doesn't mark it read. The reader lists its chapters, the current one highlighted
+while it plays, and `t` swaps the text for the transcript.
 
 ### pressbox-iced (desktop client)
 
@@ -80,7 +80,7 @@ code, ask the server to refetch every feed, and sign out, which deletes the
 token.
 
 | Key | Action |
-| --------- | ----------------- |
+| ------------- | --------------------------------------- |
 | `j` / `↓` | Next item |
 | `k` / `↑` | Previous item |
 | `s` | Toggle star |

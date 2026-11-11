@@ -12,7 +12,7 @@ or the static `tokenFile` token. A token belongs to one user, and every answer
 is about that user's feeds and state. Timestamps are Unix seconds.
 
 | Method | Path | Body / query | Response |
-| ------ | --------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------- |
+| ------ | --------------------------------- | ---------------------------------------------------------------------------------- | ------------------------------------------------------- |
 | GET | `/health` | | `ok` |
 | GET | `/api/v1/version` | | `{version, api}`, e.g. `{"version": "0.1.0", "api": 1}` |
 | POST | `/api/v1/pair` | `{"name": str}` | `{code, poll_id, expires_in}`; 429 when too many wait |
@@ -59,8 +59,8 @@ An item with audio or video has `media`: its `enclosures` (the feed's own
 which is where video and other bitrates come from), and, when the feed says,
 `duration` (seconds), `image`, `season`, `episode`, `chapters` and
 `transcripts`. RSS `<enclosure>`, Atom `rel="enclosure"` links and JSON Feed
-attachments all count. Every URL is absolute `http(s)`. A feed has `image`
-(its artwork) and `medium` (`podcast:medium`) when it says.
+attachments all count. Every URL is absolute `http(s)`. A feed has `image` (its
+artwork) and `medium` (`podcast:medium`) when it says.
 
 `position` is where this user stopped playing, in seconds; it is left out
 when 0. Clients save it with `PUT /api/v1/items/{id}/position` every so often
@@ -75,4 +75,3 @@ to: chapters come as `{start, end?, title?, image?, url?, hidden?}` sorted by
 `start` (`hidden` chapters only change the artwork), and transcripts as
 `{start, end, speaker?, text}` segments, with runs of very short cues joined
 into sentences. Files are fetched once and kept for a week.
-

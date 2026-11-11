@@ -21,29 +21,39 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
   `podcast:alternateEnclosure`s (video, other bitrates, HLS), and the episode's
   duration, artwork, season and episode, `podcast:chapters` and
   `podcast:transcript`s. Feeds carry their artwork and `podcast:medium`.
+
 - Each user's playback position is kept per item:
   `PUT /api/v1/items/{id}/position`, returned as `position`. Item lists take
   `media` and `in_progress` filters.
-- `GET /api/v1/items/{id}/chapters` and `/transcript` read an episode's
-  chapters file and best transcript (JSON, WebVTT, SRT, HTML or text) into one
-  JSON shape each, so clients don't parse them; files are kept for a week.
+
+- `GET /api/v1/items/{id}/chapters` and `/transcript` read an episode's chapters
+  file and best transcript (JSON, WebVTT, SRT, HTML or text) into one JSON shape
+  each, so clients don't parse them; files are kept for a week.
+
 - Database migration 7 adds the columns and a table for those files.
 
 - Item lists page by cursor: `GET /api/v1/items` takes `cursor` and returns
   `next_cursor`, which stays fast deep into a list (a page after 4,900 items:
   7.6 ms to 0.3 ms). `offset`/`next_offset` still work for older clients.
+
 - API responses are compressed (gzip, brotli) when the client accepts it.
+
 - Feed parsing, sanitizing and database work run off the async runtime, so a
   large feed or a long write no longer holds up API requests.
+
 - Full articles are fetched in the background, at most four feeds at once,
   instead of holding a feed-polling slot until every page has loaded.
+
 - Feed and article bodies are cut off at their size limit as they download, even
   without a `Content-Length`.
+
 - Entries unchanged since the last fetch are no longer re-sanitized (a new
   database column records each one's digest as sent), and per-feed pruning only
   runs when something was added or `maxAgeDays` is set.
+
 - `POST /api/v1/items/read-all` marks a whole list read in one request (any
   filters, search included), or only from a given item down.
+
 - A socket from systemd that isn't a TCP stream (`ListenDatagram=`, say) is
   refused at startup with a clear message, instead of failing on the first
   connection.
