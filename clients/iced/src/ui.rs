@@ -439,6 +439,8 @@ mod tests {
             last_fetched: None,
             last_error: None,
             archived: false,
+            image: None,
+            medium: None,
         }
     }
 
@@ -454,6 +456,8 @@ mod tests {
             published: 1_793_700_000,
             read,
             starred,
+            media: None,
+            position: 0,
         }
     }
 

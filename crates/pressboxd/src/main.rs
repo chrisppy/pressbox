@@ -18,6 +18,7 @@ mod api;
 mod config;
 mod db;
 mod fetch;
+mod media;
 mod pairing;
 mod sanitize;
 mod systemd;
@@ -679,6 +680,7 @@ mod tests {
                         summary: None,
                         content: None,
                         published: Some(n),
+                        media: None,
                     })
                     .collect();
                 db.upsert_items("https://a.example/", 0, &items).unwrap();

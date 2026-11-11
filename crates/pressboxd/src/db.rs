@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use pressbox_api::{Device, Feed, Item, ItemPage, ItemQuery, UserInfo};
+use pressbox_api::{Device, Feed, Item, ItemPage, ItemQuery, Media, UserInfo};
 use rusqlite::{Connection, OptionalExtension, ToSql, params, params_from_iter};
 
 use crate::{config::Config, sanitize};
@@ -183,6 +183,23 @@ const MIGRATIONS: &[&str] = &[
     DROP INDEX items_lookup;
     CREATE INDEX items_lookup ON items (source, guid, digest, published, source_digest);
     ",
+    // 7: podcasts. An item's audio/video and what describes it, as the API's
+    // `Media` in JSON (NULL: none); a feed's artwork and `podcast:medium`;
+    // each user's playback position (seconds; 0: none) beside their flags;
+    // and chapters and transcripts read from their files, by URL, as the
+    // API's JSON, so they are fetched once rather than per request.
+    r"
+    ALTER TABLE items ADD COLUMN media TEXT;
+    ALTER TABLE sources ADD COLUMN image TEXT;
+    ALTER TABLE sources ADD COLUMN medium TEXT;
+    ALTER TABLE item_state ADD COLUMN position INTEGER NOT NULL DEFAULT 0;
+    CREATE INDEX item_state_in_progress ON item_state (user_id, position) WHERE position > 0;
+    CREATE TABLE media_files (
+        url     TEXT PRIMARY KEY,
+        json    TEXT NOT NULL,
+        fetched INTEGER NOT NULL
+    );
+    ",
 ];
 
 /// An entry parsed (and sanitized) from a feed, ready to store.
@@ -195,6 +212,7 @@ pub struct NewItem {
     pub summary: Option<String>,
     pub content: Option<String>,
     pub published: Option<i64>,
+    pub media: Option<Media>,
 }
 
 /// What the fetcher needs to poll a feed URL.
@@ -219,6 +237,9 @@ pub struct FetchResult {
     pub last_modified: Option<String>,
     pub title: Option<String>,
     pub site_url: Option<String>,
+    /// The feed's artwork and `podcast:medium`.
+    pub image: Option<String>,
+    pub medium: Option<String>,
     pub error: Option<String>,
     /// When to fetch next (Unix seconds).
     pub next_fetch: i64,
@@ -394,6 +415,7 @@ impl Db {
                     summary: r.get(4)?,
                     content: r.get(5)?,
                     published: None,
+                    media: None,
                 };
                 let id: i64 = r.get(0)?;
                 set_digest.execute(params![id, digest(&item)])?;
@@ -589,7 +611,7 @@ impl Db {
                 "UPDATE sources SET last_fetched = ?2, last_error = NULL,
                     etag = ?3, last_modified = ?4,
                     title = COALESCE(?5, title), site_url = COALESCE(?6, site_url),
-                    next_fetch = ?7, fail_count = 0
+                    next_fetch = ?7, fail_count = 0, image = ?8, medium = ?9
                  WHERE url = ?1",
                 params![
                     url,
@@ -599,6 +621,8 @@ impl Db {
                     result.title,
                     result.site_url,
                     result.next_fetch,
+                    result.image,
+                    result.medium,
                 ],
             )?;
         }
@@ -653,12 +677,12 @@ impl Db {
             let mut insert = tx.prepare(
                 "INSERT INTO items
                     (source, guid, title, url, author, summary, content, published, digest,
-                     source_digest)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) RETURNING id",
+                     source_digest, media)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) RETURNING id",
             )?;
             let mut update = tx.prepare(
                 "UPDATE items SET title = ?2, url = ?3, author = ?4, summary = ?5, content = ?6,
-                    published = ?7, digest = ?8, source_digest = ?9
+                    published = ?7, digest = ?8, source_digest = ?9, media = ?10
                  WHERE id = ?1 RETURNING NULLIF(full_content, '')",
             )?;
             let mut set_source_digest =
@@ -672,6 +696,7 @@ impl Db {
                     })
                     .optional()?;
                 let digest = digest(item);
+                let media = media_json(item.media.as_ref());
                 let (id, article) = match stored {
                     None => {
                         inserted += 1;
@@ -687,6 +712,7 @@ impl Db {
                             published,
                             &digest,
                             source_digest,
+                            &media,
                         );
                         let id = insert.query_row(row, |r| r.get::<_, i64>(0))?;
                         (id, None)
@@ -712,6 +738,7 @@ impl Db {
                             new_published,
                             &digest,
                             source_digest,
+                            &media,
                         );
                         let article: Option<String> = update.query_row(row, |r| r.get(0))?;
                         unindex.execute([id])?;
@@ -782,7 +809,7 @@ impl Db {
             "SELECT s.feed_id, COALESCE(s.title, src.title, s.feed_id), src.url, src.site_url,
                     s.tags, COUNT(i.id) - COALESCE(SUM(st.read), 0), COUNT(i.id),
                     src.last_fetched, CASE WHEN s.archived = 0 THEN src.last_error END,
-                    s.archived
+                    s.archived, src.image, src.medium
              FROM subscriptions s
              JOIN sources src ON src.url = s.source
              LEFT JOIN items i ON i.source = s.source
@@ -804,6 +831,8 @@ impl Db {
                 last_fetched: r.get(7)?,
                 last_error: r.get(8)?,
                 archived: r.get(9)?,
+                image: r.get(10)?,
+                medium: r.get(11)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -931,6 +960,61 @@ impl Db {
             collect_garbage(&self.conn)?;
         }
         Ok(changed)
+    }
+
+    /// Saves where the user stopped playing an item's media. Returns false
+    /// if they cannot see the item.
+    pub fn set_position(&self, user: i64, id: i64, position: u32) -> Result<bool> {
+        let changed = self
+            .conn
+            .prepare_cached(&format!(
+                "INSERT INTO item_state (user_id, item_id, position)
+                 SELECT ?1, i.id, ?3 FROM items i {USER_JOINS}
+                 WHERE i.id = ?2 AND {VISIBLE}
+                 ON CONFLICT (user_id, item_id) DO UPDATE SET position = excluded.position"
+            ))?
+            .execute(params![user, id, position])?;
+        Ok(changed > 0)
+    }
+
+    /// An item's media, if the user can see the item. `Some(None)`: they
+    /// can, and it has none.
+    pub fn item_media(&self, user: i64, id: i64) -> Result<Option<Option<Media>>> {
+        Ok(self.item(user, id)?.map(|i| i.media))
+    }
+
+    /// A chapters or transcript file read before, as the API's JSON, if it
+    /// was fetched at `since` or later.
+    pub fn media_file(&self, url: &str, since: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT json FROM media_files WHERE url = ?1 AND fetched >= ?2",
+                params![url, since],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Keeps a chapters or transcript file, and forgets ones fetched before
+    /// `forget_before`, which nothing is likely to ask for again.
+    pub fn store_media_file(
+        &self,
+        url: &str,
+        json: &str,
+        now: i64,
+        forget_before: i64,
+    ) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM media_files WHERE fetched < ?1",
+            [forget_before],
+        )?;
+        self.conn.execute(
+            "INSERT INTO media_files (url, json, fetched) VALUES (?1, ?2, ?3)
+             ON CONFLICT (url) DO UPDATE SET json = excluded.json, fetched = excluded.fetched",
+            params![url, json, now],
+        )?;
+        Ok(())
     }
 
     /// Marks every item of one of the user's feeds read. `None` if they have
@@ -1136,13 +1220,26 @@ impl Db {
 
 /// A fingerprint of an item's text, to skip rewriting unchanged items.
 fn digest(item: &NewItem) -> String {
-    hash_fields(&[
+    let media = media_json(item.media.as_ref());
+    let mut fields = vec![
         Some(item.title.as_str()),
         item.url.as_deref(),
         item.author.as_deref(),
         item.summary.as_deref(),
         item.content.as_deref(),
-    ])
+    ];
+    // Only when there is some, so items without media keep the digests
+    // stored before pressbox knew about media.
+    if media.is_some() {
+        fields.push(media.as_deref());
+    }
+    hash_fields(&fields)
+}
+
+/// How an item's media is stored: the API's JSON.
+pub fn media_json(media: Option<&Media>) -> Option<String> {
+    // Serializing plain structs of strings and numbers can't fail.
+    media.map(|m| serde_json::to_string(m).unwrap_or_default())
 }
 
 /// A short hex digest of a list of optional fields.
@@ -1255,6 +1352,22 @@ impl Filters {
             Some(false) => clauses.push("COALESCE(st.starred, 0) = 0"),
             None => {}
         }
+        match query.media {
+            Some(true) => clauses.push("i.media IS NOT NULL"),
+            Some(false) => clauses.push("i.media IS NULL"),
+            None => {}
+        }
+        match query.in_progress {
+            // Start from the user's positions instead of scanning every item.
+            Some(true) => clauses.push(
+                "i.id IN (SELECT item_id FROM item_state
+                          WHERE user_id = ?1 AND position > 0 AND read = 0)",
+            ),
+            Some(false) => {
+                clauses.push("(COALESCE(st.position, 0) = 0 OR COALESCE(st.read, 0) = 1)");
+            }
+            None => {}
+        }
         if let Some(fts) = query.q.as_deref().and_then(fts_query) {
             if paged && query.feed.is_none() && query.starred != Some(true) {
                 // Walk items newest first and stop after a page, checking
@@ -1280,7 +1393,8 @@ impl Filters {
 /// Item columns as one user sees them, from `items i` with [`USER_JOINS`].
 const ITEM_COLUMNS: &str =
     "i.id, COALESCE(s.feed_id, i.source), i.title, i.url, i.author, i.summary,
-     i.published, COALESCE(st.read, 0), COALESCE(st.starred, 0)";
+     i.published, COALESCE(st.read, 0), COALESCE(st.starred, 0), i.media,
+     COALESCE(st.position, 0)";
 
 /// Follows `items i`: joins each item with one user's subscription (`s`)
 /// and state (`st`). Needs `?1` bound to the user's id.
@@ -1355,7 +1469,13 @@ fn item_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Item> {
         published: r.get(6)?,
         read: r.get(7)?,
         starred: r.get(8)?,
-        content: r.get(9)?,
+        // Written by `media_json`; unreadable JSON (from a newer pressboxd)
+        // is left out rather than failing the list.
+        media: r
+            .get::<_, Option<String>>(9)?
+            .and_then(|m| serde_json::from_str(&m).ok()),
+        position: r.get(10)?,
+        content: r.get(11)?,
     })
 }
 
@@ -1376,6 +1496,7 @@ mod tests {
             summary: Some("<p>summary</p>".into()),
             content: Some("<p>content</p>".into()),
             published,
+            media: None,
         }
     }
 
@@ -2279,6 +2400,7 @@ mod bench {
                     summary: Some(body.clone()),
                     content: Some(body.clone()),
                     published: Some(i64::from(n)),
+                    media: None,
                 })
                 .collect();
             db.upsert_items(&format!("https://f{f}.example/"), 0, &items)
@@ -2295,6 +2417,7 @@ mod bench {
                 summary: Some(body.clone()),
                 content: Some(body.clone()),
                 published: Some(i64::from(n)),
+                media: None,
             })
             .collect();
         db.upsert_items("https://f0.example/", 0, &again).unwrap();

@@ -716,6 +716,8 @@ mod tests {
             last_fetched: None,
             last_error: None,
             archived: false,
+            image: None,
+            medium: None,
         }
     }
 
@@ -731,6 +733,8 @@ mod tests {
             published: id,
             read: false,
             starred: false,
+            media: None,
+            position: 0,
         }
     }
 

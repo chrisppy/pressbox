@@ -425,6 +425,8 @@ mod tests {
             last_fetched: None,
             last_error: None,
             archived,
+            image: None,
+            medium: None,
         };
         let doc = opml_document(&[feed("kept", false), feed("old", true)]);
         assert!(doc.contains(r#"title="&quot;kept&quot;""#), "{doc}");

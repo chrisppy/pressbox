@@ -16,6 +16,19 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
 
 ### Server
 
+- Podcasts (Podcasting 2.0). Items carry their audio and video as `media`: the
+  RSS `<enclosure>` (or Atom enclosure link, or JSON Feed attachment), any
+  `podcast:alternateEnclosure`s (video, other bitrates, HLS), and the episode's
+  duration, artwork, season and episode, `podcast:chapters` and
+  `podcast:transcript`s. Feeds carry their artwork and `podcast:medium`.
+- Each user's playback position is kept per item:
+  `PUT /api/v1/items/{id}/position`, returned as `position`. Item lists take
+  `media` and `in_progress` filters.
+- `GET /api/v1/items/{id}/chapters` and `/transcript` read an episode's
+  chapters file and best transcript (JSON, WebVTT, SRT, HTML or text) into one
+  JSON shape each, so clients don't parse them; files are kept for a week.
+- Database migration 7 adds the columns and a table for those files.
+
 - Item lists page by cursor: `GET /api/v1/items` takes `cursor` and returns
   `next_cursor`, which stays fast deep into a list (a page after 4,900 items:
   7.6 ms to 0.3 ms). `offset`/`next_offset` still work for older clients.

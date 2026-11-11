@@ -31,6 +31,12 @@ pub struct Feed {
     /// has starred items. It is no longer fetched.
     #[serde(default)]
     pub archived: bool,
+    /// The feed's artwork (`itunes:image`, the RSS `<image>`, Atom's logo).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// `podcast:medium`: `podcast`, `music`, `video`, `audiobook`, ...
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<String>,
 }
 
 /// One entry from a feed.
@@ -51,6 +57,160 @@ pub struct Item {
     pub published: i64,
     pub read: bool,
     pub starred: bool,
+    /// Audio or video attached to the item (a podcast episode), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<Media>,
+    /// Where this user stopped playing the media, in seconds; 0 if they
+    /// haven't started it (or finished it).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub position: u32,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde passes a reference
+const fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// An item's audio or video, from RSS `<enclosure>`, Atom `rel="enclosure"`
+/// links and JSON Feed attachments, with the iTunes and Podcasting 2.0
+/// (`podcast:`) tags that describe it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Media {
+    /// The files: the feed's own enclosure first, then any
+    /// `podcast:alternateEnclosure`s (other formats, bitrates or video) in
+    /// the order the feed lists them. Never empty.
+    pub enclosures: Vec<Enclosure>,
+    /// Length in seconds, if the feed says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration: Option<u32>,
+    /// The episode's artwork, if it has its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub episode: Option<u32>,
+    /// The `podcast:chapters` file. Clients use `GET
+    /// /api/v1/items/{id}/chapters`, which reads it for them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chapters: Option<String>,
+    /// The `podcast:transcript` files. Clients use `GET
+    /// /api/v1/items/{id}/transcript`, which reads the best one for them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcripts: Vec<TranscriptFile>,
+}
+
+impl Media {
+    /// The first enclosure whose MIME type is `video/*`, if any.
+    #[must_use]
+    pub fn video(&self) -> Option<&Enclosure> {
+        self.enclosures.iter().find(|e| e.is_video())
+    }
+
+    /// The first enclosure that isn't video (the feed's own, usually).
+    #[must_use]
+    pub fn audio(&self) -> Option<&Enclosure> {
+        self.enclosures.iter().find(|e| !e.is_video())
+    }
+}
+
+/// One media file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Enclosure {
+    /// An `http(s)` URL.
+    pub url: String,
+    /// e.g. `audio/mpeg`, `video/mp4`, `application/x-mpegURL` (HLS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    /// Size in bytes, if the feed says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+    /// Bits per second, if the feed says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bitrate: Option<u32>,
+    /// Video height in pixels, if the feed says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+    /// A label for choosing between enclosures, e.g. `"1080p"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl Enclosure {
+    #[must_use]
+    pub fn is_video(&self) -> bool {
+        self.mime
+            .as_deref()
+            .is_some_and(|m| m.starts_with("video/"))
+    }
+}
+
+/// A `podcast:transcript` file.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptFile {
+    pub url: String,
+    /// e.g. `text/vtt`, `application/x-subrip`, `application/json`,
+    /// `text/html`.
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    /// `"captions"` for closed captions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rel: Option<String>,
+}
+
+/// Body for `PUT /api/v1/items/{id}/position`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Position {
+    /// Seconds into the media. 0 forgets the position (when the media was
+    /// finished, say).
+    pub position: u32,
+}
+
+/// Response to `GET /api/v1/items/{id}/chapters`, from the episode's
+/// Podcasting 2.0 chapters file.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Chapters {
+    /// In order of `start`.
+    pub chapters: Vec<Chapter>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Chapter {
+    /// Seconds from the start.
+    pub start: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Artwork to show during the chapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// A web page about the chapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Only changes the artwork: leave it out of a chapter list.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hidden: bool,
+}
+
+/// Response to `GET /api/v1/items/{id}/transcript`: the episode's best
+/// transcript (JSON, WebVTT, SRT or HTML), as timed segments. Very short
+/// cues (some files time every word) are joined into sentences.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Transcript {
+    pub segments: Vec<Segment>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Segment {
+    /// Seconds from the start; 0 for untimed (HTML or plain) transcripts.
+    pub start: f64,
+    pub end: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speaker: Option<String>,
+    /// Plain text.
+    pub text: String,
 }
 
 /// A page of items, newest first.
@@ -107,6 +267,13 @@ pub struct ItemQuery {
     pub unread: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub starred: Option<bool>,
+    /// `true`: only items with media; `false`: only items without.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<bool>,
+    /// `true`: only unread items with a saved playback position, i.e.
+    /// started and not finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub in_progress: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u32>,
     /// Skips this many items. Slow deep into a long list; prefer `cursor`.

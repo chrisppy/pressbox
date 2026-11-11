@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use crate::{
     AppState,
     db::{self, FetchResult, FetchTarget, NewItem},
-    sanitize,
+    media, sanitize,
 };
 
 const MAX_BODY: usize = 20 * 1024 * 1024;
@@ -154,7 +154,7 @@ async fn refresh_one(state: Arc<AppState>, target: FetchTarget) -> Option<usize>
             result,
             items,
             max_age,
-        }) => (result, items, Outcome::Ok { max_age }),
+        }) => (*result, items, Outcome::Ok { max_age }),
         Ok(Polled::NotModified { max_age }) => (
             FetchResult {
                 etag: target.etag.clone(),
@@ -318,6 +318,16 @@ async fn fetch_articles(state: &Arc<AppState>, feed: &str) {
     }
 }
 
+/// Fetches a small file (a podcast's chapters or transcript), up to `max`
+/// bytes.
+pub async fn download(http: &reqwest::Client, url: &str, max: usize) -> Result<Vec<u8>, String> {
+    let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
+    read_limited(resp, max, "file").await
+}
+
 async fn fetch_page(http: &reqwest::Client, url: &str) -> Result<Vec<u8>, String> {
     let resp = http.get(url).send().await.map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
@@ -372,7 +382,7 @@ pub fn extract(html: &str, url: &str) -> Option<String> {
 
 enum Polled {
     Fresh {
-        result: FetchResult,
+        result: Box<FetchResult>,
         items: Vec<RawItem>,
         max_age: Option<u64>,
     },
@@ -437,7 +447,7 @@ async fn poll(http: &reqwest::Client, target: &FetchTarget, now: i64) -> Result<
     result.etag = etag;
     result.last_modified = last_modified;
     Ok(Polled::Fresh {
-        result,
+        result: Box::new(result),
         items,
         max_age,
     })
@@ -455,6 +465,8 @@ pub struct RawItem {
     pub published: Option<i64>,
     /// What relative links resolve against.
     base: String,
+    /// Already checked: URLs are absolute `http(s)` and text is plain.
+    media: Option<pressbox_api::Media>,
 }
 
 impl RawItem {
@@ -462,7 +474,8 @@ impl RawItem {
     /// would give what is already stored.
     pub fn digest(&self) -> String {
         let published = self.published.map(|p| p.to_string());
-        db::hash_fields(&[
+        let media = db::media_json(self.media.as_ref());
+        let mut fields = vec![
             Some(self.guid.as_str()),
             self.title.as_deref(),
             self.url.as_deref(),
@@ -472,7 +485,13 @@ impl RawItem {
             published.as_deref(),
             Some(self.base.as_str()),
             Some(sanitize::VERSION),
-        ])
+        ];
+        // Only when there is some, so items without media keep the digests
+        // stored before pressbox knew about media.
+        if media.is_some() {
+            fields.push(media.as_deref());
+        }
+        db::hash_fields(&fields)
     }
 
     pub fn sanitize(self) -> NewItem {
@@ -490,6 +509,7 @@ impl RawItem {
             url: self.url,
             author: self.author,
             published: self.published,
+            media: self.media,
         }
     }
 }
@@ -508,6 +528,13 @@ pub fn parse_raw(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<Raw
         .build()
         .parse(body)?;
     let feed_url = uri.unwrap_or_default();
+    // RSS media tags, by item (feed-rs keeps the feed's order). If the
+    // counts differ the two parsers disagree about the feed; skip them.
+    let rss = media::rss(body, feed_url).filter(|m| m.items.len() == feed.entries.len());
+    let (image, medium, mut rss_items) = match rss {
+        Some(m) => (m.image, m.medium, m.items.into_iter()),
+        None => (None, None, Vec::new().into_iter()),
+    };
     let items = feed
         .entries
         .into_iter()
@@ -515,7 +542,12 @@ pub fn parse_raw(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<Raw
             let url = alternate(&e.links)
                 .or_else(|| e.links.first())
                 .map(|l| l.href.clone());
+            let media = match rss_items.next() {
+                Some(m) => m,
+                None => media::from_links(&e.links, feed_url),
+            };
             RawItem {
+                media,
                 base: sanitize::base_url(url.as_deref(), feed_url),
                 guid: e.id,
                 title: e.title.map(|t| t.content),
@@ -527,9 +559,15 @@ pub fn parse_raw(body: &[u8], uri: Option<&str>) -> Result<(FetchResult, Vec<Raw
             }
         })
         .collect();
+    let image = image.or_else(|| {
+        let logo = feed.logo.or(feed.icon)?;
+        media::http_url(&logo.uri, feed_url)
+    });
     let result = FetchResult {
         title: feed.title.map(|t| sanitize::text(&t.content)),
         site_url: alternate(&feed.links).map(|l| l.href.clone()),
+        image,
+        medium,
         ..Default::default()
     };
     Ok((result, items))
@@ -1046,6 +1084,7 @@ mod tests {
             summary: None,
             content: None,
             published: Some(1),
+            media: None,
         };
         state.db().upsert_items(&feed, 0, &[post]).unwrap();
         state.db().break_with(
@@ -1092,6 +1131,90 @@ mod tests {
             </channel></rss>"#;
         let (_, items) = parse(rss, None).unwrap();
         assert_eq!(items[0].title, "(untitled)");
+    }
+
+    #[test]
+    fn reads_podcast_media() {
+        const FEED: &str = "https://pod.example/feed.xml";
+        let rss = br#"<?xml version="1.0"?>
+            <rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd"
+                 xmlns:podcast="https://podcastindex.org/namespace/1.0"><channel>
+              <title>Pod</title><itunes:image href="show.jpg"/>
+              <podcast:medium>podcast</podcast:medium>
+              <item><title>Ep</title><guid>e1</guid>
+                <enclosure url="e1.mp3" type="audio/mpeg" length="5"/>
+                <itunes:duration>10:00</itunes:duration></item>
+              <item><title>Post</title><guid>p1</guid></item>
+            </channel></rss>"#;
+        let (meta, items) = parse_raw(rss, Some(FEED)).unwrap();
+        assert_eq!(meta.image.as_deref(), Some("https://pod.example/show.jpg"));
+        assert_eq!(meta.medium.as_deref(), Some("podcast"));
+        let media = items[0].media.clone().unwrap();
+        assert_eq!(media.enclosures[0].url, "https://pod.example/e1.mp3");
+        assert_eq!(media.duration, Some(600));
+        assert_eq!(items[1].media, None);
+
+        // Media is part of the digest, but only when there is some: items
+        // without keep the digests stored before pressbox read media.
+        let post = &items[1];
+        let old = db::hash_fields(&[
+            Some("p1"),
+            Some("Post"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(FEED),
+            Some(sanitize::VERSION),
+        ]);
+        assert_eq!(post.digest(), old);
+        let mut without = items[0].clone();
+        without.media = None;
+        assert_ne!(items[0].digest(), without.digest());
+
+        // Stored and listed.
+        let mut db = crate::db::Db::open_in_memory().unwrap();
+        db.sync(&crate::config::Config::parse(&format!("[feeds.pod]\nurl = \"{FEED}\"")).unwrap())
+            .unwrap();
+        let user = db.only_user().unwrap().unwrap().id;
+        let state = AppState::new(db, None, 100).unwrap();
+        store(&state, FEED, 0, None, items, &meta).unwrap();
+        let feed = &state.reader().feeds(user).unwrap()[0];
+        assert_eq!(
+            (feed.image.as_deref(), feed.medium.as_deref()),
+            (Some("https://pod.example/show.jpg"), Some("podcast"))
+        );
+        let page = state
+            .reader()
+            .items(user, &pressbox_api::ItemQuery::default())
+            .unwrap();
+        let ep = page.items.iter().find(|i| i.title == "Ep").unwrap();
+        assert_eq!(ep.media.as_ref().unwrap().duration, Some(600));
+
+        // A media change alone is stored.
+        let changed = String::from_utf8_lossy(rss).replace("10:00", "11:00");
+        let (meta, items) = parse_raw(changed.as_bytes(), Some(FEED)).unwrap();
+        store(&state, FEED, 0, None, items, &meta).unwrap();
+        let item = state.reader().item(user, ep.id).unwrap().unwrap();
+        assert_eq!(item.media.unwrap().duration, Some(660));
+    }
+
+    #[test]
+    fn reads_atom_enclosures_and_logos() {
+        let atom = br#"<?xml version="1.0" encoding="utf-8"?>
+            <feed xmlns="http://www.w3.org/2005/Atom">
+              <title>Atom pod</title><id>urn:f</id><updated>2026-11-01T00:00:00Z</updated>
+              <logo>/logo.png</logo>
+              <entry><title>Ep</title><id>urn:e</id><updated>2026-11-01T00:00:00Z</updated>
+                <link rel="enclosure" type="audio/ogg" length="7" href="/e.ogg"/></entry>
+            </feed>"#;
+        let (meta, items) = parse_raw(atom, Some("https://a.example/feed")).unwrap();
+        assert_eq!(meta.image.as_deref(), Some("https://a.example/logo.png"));
+        assert_eq!(meta.medium, None);
+        let media = items[0].media.clone().unwrap();
+        assert_eq!(media.enclosures[0].url, "https://a.example/e.ogg");
+        assert_eq!(media.enclosures[0].mime.as_deref(), Some("audio/ogg"));
     }
 
     #[test]

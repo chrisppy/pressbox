@@ -13,6 +13,9 @@
 //! | GET    | /api/v1/items/{id}               |                  | `Item`             |
 //! | PUT    | /api/v1/items/{id}/read          | `Flag`           | 204                |
 //! | PUT    | /api/v1/items/{id}/starred       | `Flag`           | 204                |
+//! | PUT    | /api/v1/items/{id}/position      | `Position`       | 204                |
+//! | GET    | /api/v1/items/{id}/chapters      |                  | `Chapters`         |
+//! | GET    | /api/v1/items/{id}/transcript    |                  | `Transcript`       |
 //! | POST   | /api/v1/feeds/{id}/read-all      |                  | `Updated`          |
 //! | POST   | /api/v1/items/read-all           | `MarkRead`       | `Updated`          |
 //! | POST   | /api/v1/refresh                  |                  | 202                |
@@ -39,7 +42,7 @@ use axum::{
 };
 use pressbox_api::{
     ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, MarkRead, Me, PairRequest,
-    PairStart, PendingPairing, Updated, Version,
+    PairStart, PendingPairing, Position, Updated, Version,
 };
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
@@ -47,7 +50,8 @@ use tower_http::compression::CompressionLayer;
 use crate::{
     AppState,
     db::{AuthUser, BadCursor},
-    fetch::now,
+    fetch::{self, now},
+    media,
     pairing::{PollState, StartError, hash_token},
 };
 
@@ -60,6 +64,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/items/{id}", get(item))
         .route("/items/{id}/read", put(set_read))
         .route("/items/{id}/starred", put(set_starred))
+        .route("/items/{id}/position", put(set_position))
+        .route("/items/{id}/chapters", get(chapters))
+        .route("/items/{id}/transcript", get(transcript))
         .route("/refresh", post(refresh))
         .route("/me", get(me))
         .route("/pairings", get(pairings))
@@ -94,6 +101,8 @@ pub enum ApiError {
     Unauthorized,
     Forbidden(&'static str),
     BadRequest(&'static str),
+    /// A file the request needed from elsewhere couldn't be had.
+    BadGateway(&'static str),
     TooManyRequests,
     Internal(anyhow::Error),
 }
@@ -111,6 +120,7 @@ impl IntoResponse for ApiError {
             Self::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             Self::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             Self::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            Self::BadGateway(m) => (StatusCode::BAD_GATEWAY, m),
             Self::TooManyRequests => (StatusCode::TOO_MANY_REQUESTS, "too many pending pairings"),
             Self::Internal(e) => {
                 tracing::error!("{e:#}");
@@ -237,6 +247,108 @@ async fn set_starred(
             .write(move |db| db.set_starred(user.id, id, flag.value))
             .await?,
     )
+}
+
+async fn set_position(
+    State(state): State<Arc<AppState>>,
+    Extension(user): User,
+    Path(id): Path<i64>,
+    Json(body): Json<Position>,
+) -> ApiResult<StatusCode> {
+    found(
+        state
+            .write(move |db| db.set_position(user.id, id, body.position))
+            .await?,
+    )
+}
+
+/// How long a chapters or transcript file is used before it is fetched
+/// again (they rarely change once an episode is out).
+const MEDIA_FILE_FRESH: i64 = 7 * 86_400;
+/// Files not fetched for this long are forgotten.
+const MEDIA_FILE_KEPT: i64 = 30 * 86_400;
+/// The largest chapters or transcript file fetched.
+const MAX_MEDIA_FILE: usize = 5 * 1024 * 1024;
+
+async fn chapters(
+    State(state): State<Arc<AppState>>,
+    Extension(user): User,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let media = state
+        .read(move |db| db.item_media(user.id, id))
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let url = media.and_then(|m| m.chapters).ok_or(ApiError::NotFound)?;
+    media_file(&state, url, media::chapters).await
+}
+
+async fn transcript(
+    State(state): State<Arc<AppState>>,
+    Extension(user): User,
+    Path(id): Path<i64>,
+) -> ApiResult<Response> {
+    let media = state
+        .read(move |db| db.item_media(user.id, id))
+        .await?
+        .ok_or(ApiError::NotFound)?
+        .ok_or(ApiError::NotFound)?;
+    let file = media::best_transcript(&media.transcripts)
+        .cloned()
+        .ok_or(ApiError::NotFound)?;
+    let mime = file.mime;
+    media_file(&state, file.url, move |body, _| {
+        media::transcript(body, &mime)
+    })
+    .await
+}
+
+/// A chapters or transcript file as the API's JSON: kept from an earlier
+/// request if fresh, otherwise fetched, read with `parse` and kept.
+async fn media_file<T: serde::Serialize>(
+    state: &Arc<AppState>,
+    url: String,
+    parse: impl FnOnce(&[u8], &str) -> Option<T> + Send + 'static,
+) -> ApiResult<Response> {
+    let json_response = |json: String| {
+        (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            json,
+        )
+            .into_response()
+    };
+    let key = url.clone();
+    let kept = state
+        .read(move |db| db.media_file(&key, now() - MEDIA_FILE_FRESH))
+        .await?;
+    if let Some(json) = kept {
+        return Ok(json_response(json));
+    }
+    let body = fetch::download(&state.http, &url, MAX_MEDIA_FILE)
+        .await
+        .map_err(|e| {
+            tracing::warn!(url, "fetching media file: {e}");
+            ApiError::BadGateway("could not fetch the file")
+        })?;
+    let key = url.clone();
+    let json = tokio::task::spawn_blocking(move || {
+        parse(&body, &key).map(|t| serde_json::to_string(&t).unwrap_or_default())
+    })
+    .await
+    .map_err(anyhow::Error::from)?
+    .ok_or(ApiError::BadGateway("could not read the file"))?;
+    let stored = json.clone();
+    if let Err(e) = state
+        .write(move |db| {
+            let now = now();
+            db.store_media_file(&url, &stored, now, now - MEDIA_FILE_KEPT)
+        })
+        .await
+    {
+        // It is still good for this request.
+        tracing::warn!("keeping media file: {e:#}");
+    }
+    Ok(json_response(json))
 }
 
 pub fn found(changed: bool) -> ApiResult<StatusCode> {
@@ -411,6 +523,7 @@ mod tests {
                 summary: None,
                 content: Some("full".into()),
                 published: Some(1),
+                media: None,
             }],
         )
         .unwrap();
@@ -745,6 +858,7 @@ mod tests {
             summary: None,
             content: None,
             published: Some(1),
+            media: None,
         };
         db.upsert_items("https://shared.example/", 0, &[one("shared-item")])
             .unwrap();
@@ -912,5 +1026,211 @@ mod tests {
         let v: Version = serde_json::from_slice(&body).unwrap();
         assert_eq!(v.api, 1);
         assert_eq!(v.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Serves chapters and transcripts, counting requests:
+    /// `/chapters.json`, `/t.vtt`, `/bad.json` (not chapters) and 404s.
+    async fn file_server() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = |hits: &Arc<AtomicUsize>, body: &'static str| {
+            let hits = hits.clone();
+            get(move || async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                body
+            })
+        };
+        let app = Router::new()
+            .route(
+                "/chapters.json",
+                count(&hits, r#"{"chapters":[{"startTime":0,"title":"Intro"}]}"#),
+            )
+            .route(
+                "/t.vtt",
+                count(&hits, "WEBVTT\n\n00:00.000 --> 00:01.000\n<v Ann>Hi.\n"),
+            )
+            .route("/bad.json", count(&hits, "[]"));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        (addr, hits)
+    }
+
+    /// Items: 1 has media with chapters and a transcript on `addr`, 2 has
+    /// none, 3 has media whose files are broken, 4 has media without any.
+    fn podcast_state(addr: SocketAddr) -> Arc<AppState> {
+        use pressbox_api::{Enclosure, Media, TranscriptFile};
+        let mut db = Db::open_in_memory().unwrap();
+        db.sync(&Config::parse("[feeds.p]\nurl = \"https://p.example/\"").unwrap())
+            .unwrap();
+        let media = |chapters: &str, transcript: &str| Media {
+            enclosures: vec![Enclosure {
+                url: "https://p.example/1.mp3".into(),
+                mime: Some("audio/mpeg".into()),
+                ..Enclosure::default()
+            }],
+            chapters: Some(format!("http://{addr}/{chapters}")),
+            transcripts: vec![TranscriptFile {
+                url: format!("http://{addr}/{transcript}"),
+                mime: "text/vtt".into(),
+                ..TranscriptFile::default()
+            }],
+            ..Media::default()
+        };
+        let item = |guid: &str, media| NewItem {
+            guid: guid.into(),
+            title: guid.into(),
+            url: None,
+            author: None,
+            summary: None,
+            content: None,
+            published: Some(guid.parse().unwrap()),
+            media,
+        };
+        let bare = Media {
+            enclosures: media("", "").enclosures,
+            ..Media::default()
+        };
+        db.upsert_items(
+            "https://p.example/",
+            0,
+            &[
+                item("1", Some(media("chapters.json", "t.vtt"))),
+                item("2", None),
+                item("3", Some(media("missing", "bad.json"))),
+                item("4", Some(bare)),
+            ],
+        )
+        .unwrap();
+        let mut state = AppState::new(db, T.map(str::to_owned), 500).unwrap();
+        state.http = reqwest::Client::builder().no_proxy().build().unwrap();
+        Arc::new(state)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn podcast_items_have_media_and_positions() {
+        let (addr, _) = file_server().await;
+        let s = podcast_state(addr);
+        let list = |query: &'static str| {
+            let s = s.clone();
+            async move {
+                let (_, body) = call(&s, "GET", &format!("/api/v1/items?{query}"), None, T).await;
+                let page: ItemPage = serde_json::from_str(&body).unwrap();
+                page.items
+                    .iter()
+                    .map(|i| i.title.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(list("media=true").await, ["4", "3", "1"]);
+        assert_eq!(list("media=false").await, ["2"]);
+
+        let (_, body) = call(&s, "GET", "/api/v1/items/1", None, T).await;
+        let item: Item = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            item.media.unwrap().enclosures[0].url,
+            "https://p.example/1.mp3"
+        );
+        assert!(!body.contains("position"), "0 is left out: {body}");
+
+        let (status, _) = call(
+            &s,
+            "PUT",
+            "/api/v1/items/1/position",
+            Some(r#"{"position":95}"#),
+            T,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, body) = call(&s, "GET", "/api/v1/items/1", None, T).await;
+        assert_eq!(serde_json::from_str::<Item>(&body).unwrap().position, 95);
+        assert_eq!(list("in_progress=true").await, ["1"]);
+        assert_eq!(list("in_progress=false").await, ["4", "3", "2"]);
+
+        // Finished: read, so no longer in progress whatever the position.
+        call(
+            &s,
+            "PUT",
+            "/api/v1/items/1/read",
+            Some(r#"{"value":true}"#),
+            T,
+        )
+        .await;
+        assert!(list("in_progress=true").await.is_empty());
+        assert_eq!(list("in_progress=false").await.len(), 4);
+
+        let (status, _) = call(
+            &s,
+            "PUT",
+            "/api/v1/items/99/position",
+            Some(r#"{"position":1}"#),
+            T,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chapters_and_transcripts_are_read_and_kept() {
+        use pressbox_api::{Chapters, Transcript};
+        use std::sync::atomic::Ordering;
+        let (addr, hits) = file_server().await;
+        let s = podcast_state(addr);
+
+        for _ in 0..2 {
+            let (status, body) = call(&s, "GET", "/api/v1/items/1/chapters", None, T).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let ch: Chapters = serde_json::from_str(&body).unwrap();
+            assert_eq!(ch.chapters[0].title.as_deref(), Some("Intro"));
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "fetched once, then kept");
+        let (status, body) = call(&s, "GET", "/api/v1/items/1/transcript", None, T).await;
+        assert_eq!(status, StatusCode::OK);
+        let t: Transcript = serde_json::from_str(&body).unwrap();
+        assert_eq!(t.segments[0].speaker.as_deref(), Some("Ann"));
+
+        // An old copy is fetched again.
+        s.db().break_with("UPDATE media_files SET fetched = 0");
+        call(&s, "GET", "/api/v1/items/1/chapters", None, T).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        for (uri, status) in [
+            ("/api/v1/items/2/chapters", StatusCode::NOT_FOUND),
+            ("/api/v1/items/2/transcript", StatusCode::NOT_FOUND),
+            ("/api/v1/items/4/chapters", StatusCode::NOT_FOUND),
+            ("/api/v1/items/4/transcript", StatusCode::NOT_FOUND),
+            ("/api/v1/items/99/chapters", StatusCode::NOT_FOUND),
+            ("/api/v1/items/99/transcript", StatusCode::NOT_FOUND),
+            ("/api/v1/items/3/chapters", StatusCode::BAD_GATEWAY),
+            ("/api/v1/items/3/transcript", StatusCode::OK),
+        ] {
+            assert_eq!(call(&s, "GET", uri, None, T).await.0, status, "{uri}");
+        }
+
+        // A file that can't be kept is still served.
+        s.db().break_with(
+            "CREATE TRIGGER full BEFORE INSERT ON media_files
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        );
+        let (status, _) = call(&s, "GET", "/api/v1/items/1/transcript", None, T).await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn unreadable_media_files_are_502() {
+        let (addr, _) = file_server().await;
+        let s = podcast_state(addr);
+        // The transcript of item 3 is "[]" served as WebVTT, which reads as
+        // no cues at all; as JSON it is unreadable.
+        s.db()
+            .break_with("UPDATE items SET media = replace(media, 'text/vtt', 'application/json')");
+        let (status, body) = call(&s, "GET", "/api/v1/items/3/transcript", None, T).await;
+        assert_eq!(
+            (status, body.as_str()),
+            (
+                StatusCode::BAD_GATEWAY,
+                r#"{"error":"could not read the file"}"#
+            )
+        );
     }
 }
