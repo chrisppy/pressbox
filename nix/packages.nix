@@ -62,6 +62,10 @@ _: {
         # rather than through its PulseAudio shim.
         ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.pipewire;
       gstPluginPath = lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins;
+      # GStreamer's HTTP source does TLS through GIO, whose TLS backend is a
+      # module in glib-networking: without it every https:// episode fails
+      # to start ("Element failed to change its state").
+      gioModules = "${pkgs.glib-networking}/lib/gio/modules";
       # What building (and testing) pressbox-iced needs.
       gstBuild = {
         nativeBuildInputs = [ pkgs.pkg-config ];
@@ -148,7 +152,8 @@ _: {
             ''
             + ''
               wrapProgram $out/bin/pressbox-iced \
-                --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${gstPluginPath}
+                --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${gstPluginPath} \
+                --prefix GIO_EXTRA_MODULES : ${gioModules}
             '';
 
           meta = {
@@ -162,7 +167,14 @@ _: {
       );
     in
     {
-      _module.args = { inherit guiRuntimeLibs gstLibs gstPluginPath; };
+      _module.args = {
+        inherit
+          guiRuntimeLibs
+          gstLibs
+          gstPluginPath
+          gioModules
+          ;
+      };
 
       packages = {
         inherit pressboxd pressbox pressbox-iced;

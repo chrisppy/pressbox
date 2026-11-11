@@ -107,8 +107,23 @@ impl Audio {
         if let Ok(filter) = gst::ElementFactory::make("scaletempo").build() {
             playbin.set_property("audio-filter", &filter);
         }
+        // A state change only says that it failed; why is on the bus. The
+        // pipeline is stopped, so nothing keeps playing or holds the stream.
         let failed = |e: &dyn fmt::Display| {
-            gst::glib::Error::new(gst::CoreError::StateChange, &e.to_string())
+            let reason = playbin.bus().and_then(|bus| {
+                std::iter::from_fn(|| bus.pop()).find_map(|m| match m.view() {
+                    gst::MessageView::Error(err) => Some(match err.debug() {
+                        Some(debug) => format!("{} ({debug})", err.error()),
+                        None => err.error().to_string(),
+                    }),
+                    _ => None,
+                })
+            });
+            let _ = playbin.set_state(gst::State::Null);
+            gst::glib::Error::new(
+                gst::CoreError::StateChange,
+                &reason.unwrap_or_else(|| e.to_string()),
+            )
         };
         playbin
             .set_state(gst::State::Paused)

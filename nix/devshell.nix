@@ -11,6 +11,7 @@ _: {
       guiRuntimeLibs,
       gstLibs,
       gstPluginPath,
+      gioModules,
       ...
     }:
     {
@@ -34,6 +35,7 @@ _: {
         ++ gstLibs;
         LD_LIBRARY_PATH = lib.makeLibraryPath guiRuntimeLibs;
         GST_PLUGIN_SYSTEM_PATH_1_0 = gstPluginPath;
+        GIO_EXTRA_MODULES = gioModules;
       };
 
       formatter = config.treefmt.build.wrapper;
