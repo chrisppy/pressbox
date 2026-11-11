@@ -601,33 +601,27 @@ impl App {
                     Ok(())
                 }
             }
-            Some(_) => self.finish(backend, true),
-            // The user closed mpv's window.
-            None => self.finish(backend, false),
+            // Played to the end, or (`None`) the user closed mpv's window.
+            state => {
+                if let Some(state) = state {
+                    playing.state = state;
+                }
+                self.stop(backend)
+            }
         };
         self.report(result);
     }
 
-    /// `x`: stops playing, saving the position.
+    /// `x`: stops playing. Played to (near) the end, the episode is marked
+    /// read and its position forgotten; otherwise the position is saved.
     pub fn stop(&mut self, backend: &impl Backend) -> Result<()> {
-        if self.playing.is_none() {
-            return Ok(());
-        }
-        if let Some(state) = self.player.state()
-            && let Some(playing) = self.playing.as_mut()
-        {
-            playing.state = state;
-        }
-        let ended = self.playing.as_ref().is_some_and(|p| p.state.ended);
-        self.finish(backend, ended)
-    }
-
-    /// Stops playing. Played to (near) the end, the episode is marked read
-    /// and its position forgotten; otherwise the position is saved.
-    fn finish(&mut self, backend: &impl Backend, ended: bool) -> Result<()> {
-        let Some(playing) = self.playing.take() else {
+        let Some(mut playing) = self.playing.take() else {
             return Ok(());
         };
+        if let Some(state) = self.player.state() {
+            playing.state = state;
+        }
+        let ended = playing.state.ended;
         self.player.stop();
         let near_end = playing
             .state
@@ -1377,6 +1371,14 @@ mod tests {
     }
 
     #[test]
+    fn marking_the_playing_episode() {
+        let (fake, mut app, _player) = podcast();
+        keys(&mut app, &fake, "pm");
+        assert!(app.playing.as_ref().unwrap().item.read);
+        assert!(app.items[0].read);
+    }
+
+    #[test]
     fn saving_failures_are_reported() {
         let (fake, mut app, player) = podcast();
         keys(&mut app, &fake, "p");
@@ -1518,6 +1520,9 @@ mod tests {
             (204, ""),
             (200, r#"{"updated":2}"#),
             (200, r#"{"updated":3}"#),
+            (204, ""),
+            (404, "{}"),
+            (404, "{}"),
             (401, "{}"),
         ]);
         let client = Client::new(&base, Some("t".into())).unwrap();
@@ -1541,11 +1546,14 @@ mod tests {
             Backend::mark_read(&client, &MarkRead::default()).unwrap(),
             3
         );
+        Backend::set_position(&client, 7, 5).unwrap();
+        assert!(Backend::chapters(&client, 7).unwrap().chapters.is_empty());
+        assert_eq!(Backend::transcript(&client, 7).unwrap(), None);
         app.reload(&client);
         assert_eq!(app.status, "error: the server rejected the token (401)");
         let paths: Vec<String> = requests
             .iter()
-            .take(9)
+            .take(12)
             .map(|h| h.split(' ').nth(1).unwrap().to_owned())
             .collect();
         assert_eq!(
@@ -1559,6 +1567,9 @@ mod tests {
                 "/api/v1/items/7/starred",
                 "/api/v1/feeds/a/read-all",
                 "/api/v1/items/read-all",
+                "/api/v1/items/7/position",
+                "/api/v1/items/7/chapters",
+                "/api/v1/items/7/transcript",
                 "/api/v1/feeds"
             ]
         );

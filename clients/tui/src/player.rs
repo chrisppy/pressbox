@@ -363,6 +363,14 @@ pub mod tests {
     }
 
     #[test]
+    fn stopping_ends_the_process() {
+        let mut mpv = Mpv::new("mpv");
+        mpv.child = Some(Command::new("sleep").arg("30").spawn().unwrap());
+        mpv.stop();
+        assert!(mpv.child.is_none());
+    }
+
+    #[test]
     fn mpv_arguments() {
         let mpv = Mpv::new("mpv");
         let audio = mpv.args("https://x/a.mp3", "Ep 1", 90, false);
