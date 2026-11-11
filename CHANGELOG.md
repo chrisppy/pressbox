@@ -6,13 +6,18 @@ SPDX-License-Identifier: GPL-3.0-only
 # Changelog
 
 All notable changes to pressbox. The format follows
-[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
-[Semantic Versioning](https://semver.org/). The server, `pressboxctl` and the
-terminal client share one version number; the HTTP API has its own (the `v1` in
-`/api/v1`), which only changes on an incompatible change. The iOS app,
-[pressbox-ios](https://github.com/chrisppy/pressbox-ios), has its own releases.
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions are
+[calendar versions](https://calver.org/), `YYYY.M.PATCH`: the year and month of
+the release, then a count that starts at 0 each month (2026.11.0, 2026.11.1,
+2026.12.0). They say when, not how much changed; read the entries for that. The
+server, `pressboxctl` and the clients in this repository share one version; the
+HTTP API has its own (the `v1` in `/api/v1`), which only changes on an
+incompatible change. The Apple and Android apps,
+[pressbox-darwin](https://github.com/chrisppy/pressbox-darwin) and
+[pressbox-android](https://github.com/chrisppy/pressbox-android), have their own
+releases.
 
-## [Unreleased]
+## [2026.11.0] - Unreleased
 
 ### Server
 
@@ -127,4 +132,5 @@ The first release.
 - Checks: NixOS and Home Manager module tests, a NixOS VM test, treefmt and
   reuse lint; `cargo deny` in CI.
 
+[2026.11.0]: https://github.com/chrisppy/pressbox/compare/v0.1.0...v2026.11.0
 [0.1.0]: https://github.com/chrisppy/pressbox/releases/tag/v0.1.0

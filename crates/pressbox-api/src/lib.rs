@@ -363,7 +363,7 @@ pub const API_VERSION: u32 = 1;
 /// `GET /api/v1/version`, which needs no token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
-    /// pressboxd's version, e.g. `0.1.0`.
+    /// pressboxd's version, e.g. `2026.11.0`.
     pub version: String,
     /// The API version, as in `/api/v1`.
     pub api: u32,

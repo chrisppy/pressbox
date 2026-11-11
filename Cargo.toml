@@ -9,7 +9,7 @@ resolver = "3"
 edition      = "2024"
 repository   = "https://github.com/chrisppy/pressbox"
 rust-version = "1.89"
-version      = "0.1.0"
+version      = "2026.11.0"
 
 [workspace.lints.rust]
 # `#[cfg(not(tarpaulin_include))]` marks code `just coverage` leaves out of
