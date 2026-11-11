@@ -132,5 +132,5 @@ The first release.
 - Checks: NixOS and Home Manager module tests, a NixOS VM test, treefmt and
   reuse lint; `cargo deny` in CI.
 
-[2026.11.0]: https://github.com/chrisppy/pressbox/compare/v0.1.0...v2026.11.0
 [0.1.0]: https://github.com/chrisppy/pressbox/releases/tag/v0.1.0
+[2026.11.0]: https://github.com/chrisppy/pressbox/compare/v0.1.0...v2026.11.0
