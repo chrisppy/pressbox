@@ -7,8 +7,8 @@ use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use pressbox_api::{
-    ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, MarkRead, Me, PairApproved,
-    PairRequest, PairStart, PendingPairing, Updated, Version,
+    ApproveRequest, Approved, Chapters, Feed, Flag, Item, ItemPage, ItemQuery, MarkRead, Me,
+    PairApproved, PairRequest, PairStart, PendingPairing, Position, Transcript, Updated, Version,
 };
 use serde::Deserialize;
 
@@ -19,6 +19,8 @@ use serde::Deserialize;
 pub struct ClientConfig {
     pub server: Option<String>,
     pub token_file: Option<PathBuf>,
+    /// The mpv to play podcasts with; `mpv` on the `PATH` if unset.
+    pub player: Option<String>,
 }
 
 impl ClientConfig {
@@ -112,6 +114,36 @@ impl Client {
                 .json(&Flag { value }),
         )?;
         Ok(())
+    }
+
+    /// Saves where playback of an item's media stopped, in seconds.
+    pub fn set_position(&self, id: i64, position: u32) -> Result<()> {
+        let path = format!("/api/v1/items/{id}/position");
+        Self::send(
+            self.request(reqwest::Method::PUT, &path)
+                .json(&Position { position }),
+        )?;
+        Ok(())
+    }
+
+    /// An item's chapters; none if it has no chapters file.
+    pub fn chapters(&self, id: i64) -> Result<Chapters> {
+        let path = format!("/api/v1/items/{id}/chapters");
+        let resp = self.request(reqwest::Method::GET, &path).send()?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(Chapters::default());
+        }
+        Ok(Self::send_checked(resp)?.json()?)
+    }
+
+    /// An item's transcript; `None` if it has none.
+    pub fn transcript(&self, id: i64) -> Result<Option<Transcript>> {
+        let path = format!("/api/v1/items/{id}/transcript");
+        let resp = self.request(reqwest::Method::GET, &path).send()?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(Self::send_checked(resp)?.json()?))
     }
 
     pub fn mark_feed_read(&self, feed: &str) -> Result<u32> {
@@ -321,17 +353,59 @@ mod tests {
     }
 
     #[test]
+    fn podcast_routes() {
+        let (base, requests) = server(vec![
+            (204, ""),
+            (200, r#"{"chapters":[{"start":0.0,"title":"Intro"}]}"#),
+            (404, "{}"),
+            (200, r#"{"segments":[{"start":0.0,"end":1.0,"text":"Hi"}]}"#),
+            (404, "{}"),
+            (502, "{}"),
+        ]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        client.set_position(7, 95).unwrap();
+        assert_eq!(
+            client.chapters(7).unwrap().chapters[0].title.as_deref(),
+            Some("Intro")
+        );
+        assert!(client.chapters(8).unwrap().chapters.is_empty());
+        assert_eq!(
+            client.transcript(7).unwrap().unwrap().segments[0].text,
+            "Hi"
+        );
+        assert_eq!(client.transcript(8).unwrap(), None);
+        assert!(format!("{:#}", client.transcript(9).unwrap_err()).contains("502"));
+        let lines: Vec<String> = requests
+            .iter()
+            .take(6)
+            .map(|h| h.lines().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "put /api/v1/items/7/position http/1.1",
+                "get /api/v1/items/7/chapters http/1.1",
+                "get /api/v1/items/8/chapters http/1.1",
+                "get /api/v1/items/7/transcript http/1.1",
+                "get /api/v1/items/8/transcript http/1.1",
+                "get /api/v1/items/9/transcript http/1.1",
+            ]
+        );
+    }
+
+    #[test]
     fn reads_home_manager_config() {
         let dir = std::env::temp_dir().join(format!("pressbox-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("client.json");
         std::fs::write(
             &path,
-            r#"{"server":"https://rss.example","tokenFile":"/run/secrets/pressbox"}"#,
+            r#"{"server":"https://rss.example","tokenFile":"/run/secrets/pressbox","player":"/bin/mpv"}"#,
         )
         .unwrap();
         let config = ClientConfig::load(&path).unwrap();
         assert_eq!(config.server.as_deref(), Some("https://rss.example"));
+        assert_eq!(config.player.as_deref(), Some("/bin/mpv"));
         assert_eq!(
             config.token_file.as_deref(),
             Some(std::path::Path::new("/run/secrets/pressbox"))

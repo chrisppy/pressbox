@@ -62,6 +62,11 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
 
 ### Terminal client
 
+- Plays podcasts in mpv: `p` plays or pauses, `V` plays the video, `x` stops,
+  `,`/`.` seek, `[`/`]` move between chapters and `-`/`+` change the speed. The
+  position syncs with the server, so playback resumes on any client, and an
+  episode played to the end is marked read. The reader lists chapters and `t`
+  shows the transcript. `client.json` (and Home Manager) can set the `player`.
 - Pages by cursor, falling back to offsets with an older server; asks for gzip
   responses. Loading more items no longer repeats the first page.
 - `M` marks the selected item and every item below it read, including ones not

@@ -45,7 +45,25 @@ requests, and `pressbox whoami` shows the signed-in user and device.
 | `M` | Mark the selected item and all below it read |
 | `u` | Cycle unread / all / read items |
 | `r` / `R` | Reload from server / ask server to refetch |
+| `p` | Play the episode (or pause / resume it) |
+| `V` | Play the episode's video |
+| `x` | Stop playing (saves where you were) |
+| `,` / `.` | Back 10s / forward 30s |
+| `[` / `]` | Previous / next chapter |
+| `-` / `+` | Slower / faster |
+| `t` | Show the episode's transcript (in the reader) |
 | `q` | Quit |
+
+Podcast episodes (items with audio or video) are marked `♪` in the list, `◐`
+once started and `▶` while playing. They play in [mpv](https://mpv.io), which
+must be installed (or set `player` in `client.json`, or `programs.pressbox.player`
+in Home Manager): audio plays in the background, video in mpv's window. The
+line above the status shows the time, chapter and speed. The position is saved
+on the server every 15 seconds, on pause and on stop, so playing resumes where
+you left off on any client; an episode played to the end (or stopped in its
+last 30 seconds) is marked read. Opening an episode doesn't mark it read. The
+reader lists its chapters, the current one highlighted while it plays, and `t`
+swaps the text for the transcript.
 
 ### pressbox-iced (desktop client)
 

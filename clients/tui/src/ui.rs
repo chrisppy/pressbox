@@ -14,11 +14,18 @@ use ratatui::{
 
 use crate::app::{ALL_ROW, App, FIXED_ROWS, Pane, STARRED_ROW};
 
-const HELP: &str = "j/k move  enter open  / search  m read  M read below  s star  o browser  A all read  u unread/all/read  r reload  R refresh  q quit";
+const HELP: &str = "j/k move  enter open  / search  m read  M read below  s star  o browser  p play  A all read  u unread/all/read  r reload  R refresh  q quit";
+const PLAYER_HELP: &str = "p pause  ,/. seek  [/] chapter  +/- speed  x stop";
 
 pub fn draw(frame: &mut Frame, app: &App) {
-    let [body, status] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(frame.area());
+    let bar = u16::from(app.playing.is_some());
+    let [body, player, status] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(bar),
+        Constraint::Length(1),
+    ])
+    .areas(frame.area());
+    draw_player(frame, app, player);
     let [feeds, right] =
         Layout::horizontal([Constraint::Percentage(25), Constraint::Min(20)]).areas(body);
 
@@ -106,6 +113,60 @@ fn date(ts: i64) -> String {
         .map_or_else(String::new, |d| d.format("%b %d").to_string())
 }
 
+/// `m:ss`, or `h:mm:ss` from an hour.
+pub fn clock(seconds: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let s = seconds.max(0.0) as u64;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// The line about the episode playing: title, time, chapter and speed.
+fn draw_player(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(playing) = &app.playing else { return };
+    let state = &playing.state;
+    let mut spans = vec![
+        Span::raw(if state.paused { "⏸ " } else { "▶ " })
+            .green()
+            .bold(),
+        Span::raw(playing.item.title.clone()).bold(),
+        Span::raw("  "),
+        Span::raw(match state.duration {
+            Some(d) => format!("{} / {}", clock(state.position), clock(d)),
+            None => clock(state.position),
+        })
+        .cyan(),
+    ];
+    if let Some(chapter) = playing.chapter().and_then(|c| c.title.as_ref()) {
+        spans.push(Span::raw(format!("  · {chapter}")).magenta());
+    }
+    if (state.speed - 1.0).abs() > f64::EPSILON {
+        spans.push(Span::raw(format!("  {}x", state.speed)).yellow());
+    }
+    if playing.video {
+        spans.push(Span::raw("  (video)").dark_gray());
+    }
+    spans.push(Span::raw(format!("   {PLAYER_HELP}")).dark_gray());
+    frame.render_widget(Line::from(spans), area);
+}
+
+/// The column marking episodes: playing, started, or not yet.
+fn media_mark(app: &App, item: &pressbox_api::Item) -> &'static str {
+    if item.media.is_none() {
+        "  "
+    } else if app.playing.as_ref().is_some_and(|p| p.item.id == item.id) {
+        "▶ "
+    } else if item.position > 0 {
+        "◐ "
+    } else {
+        "♪ "
+    }
+}
+
 fn draw_items(frame: &mut Frame, app: &App, area: Rect) {
     let show_feed = app.feed_row < FIXED_ROWS;
     let rows: Vec<ListItem> = app
@@ -115,6 +176,7 @@ fn draw_items(frame: &mut Frame, app: &App, area: Rect) {
             let mut spans = vec![
                 Span::raw(if item.read { "  " } else { "● " }).cyan(),
                 Span::raw(if item.starred { "★ " } else { "  " }).yellow(),
+                Span::raw(media_mark(app, item)).green(),
                 Span::raw(format!("{:<7}", date(item.published))).dark_gray(),
             ];
             if show_feed {
@@ -162,14 +224,39 @@ fn draw_reader(frame: &mut Frame, app: &App, area: Rect) {
     if let Some(url) = &item.url {
         lines.push(Line::from(url.clone()).blue().underlined());
     }
+    let playing = app
+        .playing
+        .as_ref()
+        .filter(|p| p.item.id == item.id)
+        .map(|p| p.state.position);
+    if let Some(media) = &item.media {
+        lines.push(media_line(item, media).green());
+        let mut keys = "p play".to_owned();
+        if media.video().is_some() {
+            keys.push_str("  V video");
+        }
+        if !media.transcripts.is_empty() {
+            keys.push_str(if reader.show_transcript {
+                "  t text"
+            } else {
+                "  t transcript"
+            });
+        }
+        lines.push(Line::from(keys).dark_gray());
+    }
     lines.push(Line::default());
-    let html = item
-        .content
-        .as_deref()
-        .or(item.summary.as_deref())
-        .unwrap_or("");
-    let body = html2text::from_read(html.as_bytes(), width).unwrap_or_else(|_| html.to_owned());
-    lines.extend(body.lines().map(|l| Line::from(l.to_owned())));
+    if reader.show_transcript {
+        lines.extend(transcript_lines(reader, playing));
+    } else {
+        lines.extend(chapter_lines(&reader.chapters, playing));
+        let html = item
+            .content
+            .as_deref()
+            .or(item.summary.as_deref())
+            .unwrap_or("");
+        let body = html2text::from_read(html.as_bytes(), width).unwrap_or_else(|_| html.to_owned());
+        lines.extend(body.lines().map(|l| Line::from(l.to_owned())));
+    }
 
     let flags = match (item.read, item.starred) {
         (_, true) => " ★ ",
@@ -181,6 +268,72 @@ fn draw_reader(frame: &mut Frame, app: &App, area: Rect) {
         .wrap(Wrap { trim: false })
         .scroll((reader.scroll, 0));
     frame.render_widget(paragraph, area);
+}
+
+/// "♪ 1:02:03 · S2E10 · 23:10 played" for the reader.
+fn media_line(item: &pressbox_api::Item, media: &pressbox_api::Media) -> Line<'static> {
+    let mut parts = vec![if media.video().is_some() {
+        "▶ video".to_owned()
+    } else {
+        "♪ audio".to_owned()
+    }];
+    if let Some(d) = media.duration {
+        parts.push(clock(f64::from(d)));
+    }
+    match (media.season, media.episode) {
+        (Some(s), Some(e)) => parts.push(format!("S{s}E{e}")),
+        (None, Some(e)) => parts.push(format!("episode {e}")),
+        _ => {}
+    }
+    if item.position > 0 {
+        parts.push(format!("{} played", clock(f64::from(item.position))));
+    }
+    Line::from(parts.join(" · "))
+}
+
+/// The chapter list, the current one marked while the episode plays.
+fn chapter_lines(chapters: &[pressbox_api::Chapter], playing: Option<f64>) -> Vec<Line<'static>> {
+    let visible: Vec<_> = chapters.iter().filter(|c| !c.hidden).collect();
+    if visible.is_empty() {
+        return Vec::new();
+    }
+    let current = playing.and_then(|at| visible.iter().rposition(|c| c.start <= at));
+    let mut lines = vec![Line::from("Chapters").bold()];
+    for (i, c) in visible.iter().enumerate() {
+        let title = c.title.clone().unwrap_or_default();
+        let line = Line::from(format!("  {:>8}  {title}", clock(c.start)));
+        lines.push(if current == Some(i) {
+            line.green().bold()
+        } else {
+            line
+        });
+    }
+    lines.push(Line::default());
+    lines
+}
+
+/// The transcript, one segment a line, the one being heard highlighted.
+fn transcript_lines(reader: &crate::app::Reader, playing: Option<f64>) -> Vec<Line<'static>> {
+    let Some(Some(transcript)) = &reader.transcript else {
+        return vec![Line::from("No transcript.").dark_gray()];
+    };
+    transcript
+        .segments
+        .iter()
+        .map(|seg| {
+            let mut spans = vec![Span::raw(format!("{:>8}  ", clock(seg.start))).dark_gray()];
+            if let Some(speaker) = &seg.speaker {
+                spans.push(Span::raw(format!("{speaker}: ")).magenta().bold());
+            }
+            spans.push(Span::raw(seg.text.clone()));
+            let line = Line::from(spans);
+            if playing.is_some_and(|at| seg.start <= at && at < seg.end) {
+                line.yellow()
+            } else {
+                line
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -203,6 +356,8 @@ mod tests {
             last_fetched: None,
             last_error: None,
             archived: false,
+            image: None,
+            medium: None,
         }
     }
 
@@ -218,6 +373,8 @@ mod tests {
             published: 1_793_700_000,
             read,
             starred,
+            media: None,
+            position: 0,
         }
     }
 
@@ -305,10 +462,7 @@ mod tests {
     #[test]
     fn draws_the_reader() {
         let mut app = app();
-        app.reader = Some(Reader {
-            item: item(1, "a", false, false),
-            scroll: 0,
-        });
+        app.reader = Some(Reader::new(item(1, "a", false, false)));
         app.focus = Pane::Reader;
         let rows = screen(&app, 100, 24);
         for text in [
@@ -364,5 +518,180 @@ mod tests {
     fn dates_are_short() {
         assert_eq!(date(i64::MAX), "");
         assert_eq!(date(1_793_700_000).len(), 6, "like \"Nov 03\"");
+    }
+
+    fn episode(id: i64) -> Item {
+        use pressbox_api::{Enclosure, Media, TranscriptFile};
+        let mut item = item(id, "a", false, false);
+        item.media = Some(Media {
+            enclosures: vec![Enclosure {
+                url: "https://a.example/1.mp4".into(),
+                mime: Some("video/mp4".into()),
+                ..Enclosure::default()
+            }],
+            duration: Some(3723),
+            season: Some(2),
+            episode: Some(10),
+            transcripts: vec![TranscriptFile::default()],
+            ..Media::default()
+        });
+        item.position = 65;
+        item
+    }
+
+    fn chapters() -> Vec<pressbox_api::Chapter> {
+        let chapter = |start: f64, title: Option<&str>, hidden| pressbox_api::Chapter {
+            start,
+            title: title.map(Into::into),
+            hidden,
+            ..pressbox_api::Chapter::default()
+        };
+        vec![
+            chapter(0.0, Some("Intro"), false),
+            chapter(30.0, None, true),
+            chapter(60.0, Some("News"), false),
+            chapter(4000.0, None, false),
+        ]
+    }
+
+    fn playing(item: Item, paused: bool, speed: f64, video: bool) -> crate::app::Playing {
+        crate::app::Playing::new(
+            item,
+            chapters(),
+            crate::player::PlayerState {
+                position: 70.0,
+                duration: Some(3723.0),
+                paused,
+                speed,
+                ended: false,
+            },
+            video,
+        )
+    }
+
+    #[test]
+    fn draws_episodes_and_the_player() {
+        let mut app = app();
+        let mut started = episode(3);
+        started.title = "Started".into();
+        let mut fresh = episode(4);
+        fresh.position = 0;
+        app.items = vec![episode(1), item(2, "a", false, false), started, fresh];
+        app.playing = Some(playing(episode(1), false, 1.5, true));
+        let rows = screen(&app, 160, 12);
+        for text in [
+            "▶ Story 1  1:10 / 1:02:03  · News  1.5x  (video)   p pause",
+            "▶ Nov",
+            "◐ Nov",
+            "♪ Nov",
+        ] {
+            assert!(
+                contains(&rows, text),
+                "{text:?} missing:\n{}",
+                rows.join("\n")
+            );
+        }
+
+        // Paused, normal speed, audio, a long way in, no chapter title.
+        let mut p = playing(episode(1), true, 1.0, false);
+        p.state.duration = None;
+        p.chapters.clear();
+        app.playing = Some(p);
+        let rows = screen(&app, 160, 12);
+        assert!(
+            contains(&rows, "⏸ Story 1  1:10   p pause"),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_reader_shows_episodes() {
+        let mut app = app();
+        let mut reader = Reader::new(episode(1));
+        reader.chapters = chapters();
+        app.reader = Some(reader);
+        app.focus = Pane::Reader;
+        app.playing = Some(playing(episode(1), false, 1.0, false));
+        let rows = screen(&app, 100, 30);
+        for text in [
+            "▶ video · 1:02:03 · S2E10 · 1:05 played",
+            "p play  V video  t transcript",
+            "Chapters",
+            "    0:00  Intro",
+            "    1:00  News",
+            "1:06:40",
+        ] {
+            assert!(
+                contains(&rows, text),
+                "{text:?} missing:\n{}",
+                rows.join("\n")
+            );
+        }
+        assert!(!contains(&rows, "0:30"), "hidden chapters aren't listed");
+
+        // The transcript, the segment being heard highlighted.
+        let reader = app.reader.as_mut().unwrap();
+        reader.show_transcript = true;
+        reader.transcript = Some(Some(pressbox_api::Transcript {
+            segments: vec![
+                pressbox_api::Segment {
+                    start: 60.0,
+                    end: 80.0,
+                    speaker: Some("Ann".into()),
+                    text: "Now.".into(),
+                },
+                pressbox_api::Segment {
+                    start: 80.0,
+                    end: 90.0,
+                    speaker: None,
+                    text: "Later.".into(),
+                },
+            ],
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let rows = screen(&app, 100, 30);
+        assert!(contains(&rows, "t text"));
+        let now = rows.iter().position(|r| r.contains("Ann: Now.")).unwrap();
+        let later = rows.iter().position(|r| r.contains("Later.")).unwrap();
+        let buffer = terminal.backend().buffer();
+        // The colour of the first cell of `text` in row `row`.
+        let fg = |row: usize, text: &str| {
+            let byte = rows[row].find(text).unwrap();
+            let col = u16::try_from(rows[row][..byte].chars().count()).unwrap();
+            buffer[(col, u16::try_from(row).unwrap())].fg
+        };
+        assert_eq!(fg(now, "Now."), Color::Yellow);
+        assert_ne!(fg(later, "Later."), Color::Yellow);
+
+        app.reader.as_mut().unwrap().transcript = Some(None);
+        assert!(contains(&screen(&app, 100, 30), "No transcript."));
+
+        // Audio-only, no numbers: the short forms.
+        let mut plain = episode(5);
+        let media = plain.media.as_mut().unwrap();
+        (media.season, media.duration, media.enclosures[0].mime) = (None, None, None);
+        media.transcripts.clear();
+        plain.position = 0;
+        app.reader = Some(Reader::new(plain.clone()));
+        let rows = screen(&app, 100, 30);
+        assert!(
+            contains(&rows, "♪ audio · episode 10"),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(!contains(&rows, "V video") && !contains(&rows, "Chapters"));
+        plain.media.as_mut().unwrap().episode = None;
+        app.reader = Some(Reader::new(plain));
+        assert!(contains(&screen(&app, 100, 30), "♪ audio"));
+    }
+
+    #[test]
+    fn clocks() {
+        assert_eq!(clock(0.0), "0:00");
+        assert_eq!(clock(-5.0), "0:00");
+        assert_eq!(clock(65.9), "1:05");
+        assert_eq!(clock(3723.0), "1:02:03");
     }
 }

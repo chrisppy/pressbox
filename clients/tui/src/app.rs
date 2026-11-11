@@ -5,12 +5,22 @@
 //! tested without a terminal.
 
 use anyhow::Result;
-use pressbox_api::{Feed, Item, ItemPage, ItemQuery, MarkRead};
+use pressbox_api::{Chapter, Chapters, Feed, Item, ItemPage, ItemQuery, MarkRead, Transcript};
 use ratatui::crossterm::event::KeyCode;
 
-use crate::client::Client;
+use crate::{
+    client::Client,
+    player::{Mpv, Player, PlayerState},
+};
 
 const PAGE: u32 = 100;
+/// While playing, the position is saved after it moves this many seconds.
+const SAVE_EVERY: u32 = 15;
+/// Stopping this close to the end (seconds) counts as finishing.
+const NEAR_END: f64 = 30.0;
+/// `,` and `.` seek back and forward this far (seconds).
+const SEEK_BACK: f64 = 10.0;
+const SEEK_FORWARD: f64 = 30.0;
 
 /// The calls the app makes, so tests can swap in a fake server.
 pub trait Backend {
@@ -22,6 +32,9 @@ pub trait Backend {
     fn mark_feed_read(&self, feed: &str) -> Result<u32>;
     fn mark_read(&self, request: &MarkRead) -> Result<u32>;
     fn refresh(&self) -> Result<()>;
+    fn set_position(&self, id: i64, position: u32) -> Result<()>;
+    fn chapters(&self, id: i64) -> Result<Chapters>;
+    fn transcript(&self, id: i64) -> Result<Option<Transcript>>;
 }
 
 impl Backend for Client {
@@ -48,6 +61,15 @@ impl Backend for Client {
     }
     fn refresh(&self) -> Result<()> {
         Client::refresh(self)
+    }
+    fn set_position(&self, id: i64, position: u32) -> Result<()> {
+        Client::set_position(self, id, position)
+    }
+    fn chapters(&self, id: i64) -> Result<Chapters> {
+        Client::chapters(self, id)
+    }
+    fn transcript(&self, id: i64) -> Result<Option<Transcript>> {
+        Client::transcript(self, id)
     }
 }
 
@@ -103,6 +125,63 @@ impl Show {
 pub struct Reader {
     pub item: Item,
     pub scroll: u16,
+    /// The episode's chapters, if it has any.
+    pub chapters: Vec<Chapter>,
+    /// Loaded the first time `t` shows it; `Some(None)`: there is none.
+    pub transcript: Option<Option<Transcript>>,
+    /// Showing the transcript instead of the text.
+    pub show_transcript: bool,
+}
+
+impl Reader {
+    pub fn new(item: Item) -> Self {
+        Self {
+            item,
+            scroll: 0,
+            chapters: Vec::new(),
+            transcript: None,
+            show_transcript: false,
+        }
+    }
+}
+
+/// The episode being played.
+pub struct Playing {
+    pub item: Item,
+    pub chapters: Vec<Chapter>,
+    /// As of the last tick.
+    pub state: PlayerState,
+    pub video: bool,
+    /// The position last saved on the server.
+    saved: u32,
+}
+
+impl Playing {
+    pub fn new(item: Item, chapters: Vec<Chapter>, state: PlayerState, video: bool) -> Self {
+        let mut playing = Self {
+            item,
+            chapters,
+            state,
+            video,
+            saved: 0,
+        };
+        playing.saved = playing.position();
+        playing
+    }
+
+    /// The chapter at the current position, if there are chapters.
+    pub fn chapter(&self) -> Option<&Chapter> {
+        self.chapters
+            .iter()
+            .filter(|c| !c.hidden)
+            .take_while(|c| c.start <= self.state.position)
+            .last()
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn position(&self) -> u32 {
+        self.state.position.max(0.0) as u32
+    }
 }
 
 pub enum Action {
@@ -126,6 +205,8 @@ pub struct App {
     pub search: Option<String>,
     /// Text being typed after `/`, while the search prompt is open.
     pub editing: Option<String>,
+    pub player: Box<dyn Player>,
+    pub playing: Option<Playing>,
 }
 
 /// Where the next page of items starts: a cursor, or an offset from a server
@@ -159,6 +240,8 @@ impl App {
             status: String::new(),
             search: None,
             editing: None,
+            player: Box::new(Mpv::new("mpv")),
+            playing: None,
         }
     }
 
@@ -301,6 +384,16 @@ impl App {
                         action = Action::Open(url);
                     }
                 }
+                KeyCode::Char('p') => self.play_or_pause(backend, false)?,
+                KeyCode::Char('V') => self.play_or_pause(backend, true)?,
+                KeyCode::Char('x') => self.stop(backend)?,
+                KeyCode::Char(',') => self.seek(-SEEK_BACK)?,
+                KeyCode::Char('.') => self.seek(SEEK_FORWARD)?,
+                KeyCode::Char(']') => self.chapter(true)?,
+                KeyCode::Char('[') => self.chapter(false)?,
+                KeyCode::Char('+') => self.speed(0.25)?,
+                KeyCode::Char('-') => self.speed(-0.25)?,
+                KeyCode::Char('t') => self.toggle_transcript(backend)?,
                 KeyCode::Char('A') => self.mark_feed_read(backend)?,
                 KeyCode::Char('M') => self.mark_below_read(backend)?,
                 KeyCode::Char('u') => {
@@ -397,9 +490,240 @@ impl App {
             return Ok(());
         };
         let item = backend.item(id)?;
-        self.reader = Some(Reader { item, scroll: 0 });
+        let mut reader = Reader::new(item);
+        if reader
+            .item
+            .media
+            .as_ref()
+            .is_some_and(|m| m.chapters.is_some())
+        {
+            // Not worth failing the article for.
+            reader.chapters = backend.chapters(id).map(|c| c.chapters).unwrap_or_default();
+        }
+        // An episode isn't read until it is played to the end.
+        let episode = reader.item.media.is_some();
+        self.reader = Some(reader);
         self.focus = Pane::Reader;
-        self.mark(backend, true)
+        if episode {
+            Ok(())
+        } else {
+            self.mark(backend, true)
+        }
+    }
+
+    /// `p`/`V`: pauses or resumes the episode playing, or starts the
+    /// current item's (its video, with `video`).
+    fn play_or_pause(&mut self, backend: &impl Backend, video: bool) -> Result<()> {
+        let current = self.current_item().filter(|i| i.media.is_some()).cloned();
+        let same = |p: &Playing| current.as_ref().is_none_or(|c| c.id == p.item.id);
+        if let Some(playing) = self
+            .playing
+            .as_mut()
+            .filter(|p| same(p) && p.video == video)
+        {
+            self.player.toggle_pause()?;
+            playing.state.paused = !playing.state.paused;
+            if playing.state.paused {
+                // Pausing is a good moment to save; the next tick does.
+                playing.saved = u32::MAX;
+            }
+            return Ok(());
+        }
+        let Some(item) = current else {
+            self.status = "nothing to play here".into();
+            return Ok(());
+        };
+        let media = item.media.clone().unwrap_or_default();
+        let enclosure = if video {
+            media.video()
+        } else {
+            media.audio().or_else(|| media.video())
+        };
+        let Some(enclosure) = enclosure else {
+            self.status = "this episode has no video".into();
+            return Ok(());
+        };
+        self.stop(backend)?;
+        // Stopping may have just saved a newer position (switching between
+        // an episode's audio and video).
+        let position = self
+            .items
+            .iter()
+            .find(|i| i.id == item.id)
+            .map_or(item.position, |i| i.position);
+        // Played to the end before: start again.
+        let near_end = |d: u32| f64::from(position) >= f64::from(d) - NEAR_END;
+        let start = if media.duration.is_some_and(near_end) {
+            0
+        } else {
+            position
+        };
+        self.player
+            .load(&enclosure.url, &item.title, start, video)?;
+        let chapters = match self.reader.as_ref().filter(|r| r.item.id == item.id) {
+            Some(r) => r.chapters.clone(),
+            None if media.chapters.is_some() => backend
+                .chapters(item.id)
+                .map(|c| c.chapters)
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        self.status = format!("playing {}", item.title);
+        let state = PlayerState {
+            position: f64::from(start),
+            duration: media.duration.map(f64::from),
+            paused: false,
+            speed: 1.0,
+            ended: false,
+        };
+        self.playing = Some(Playing::new(item, chapters, state, video));
+        Ok(())
+    }
+
+    /// Called about once a second while playing: follows the player, saves
+    /// the position now and then, and notices the end.
+    pub fn tick(&mut self, backend: &impl Backend) {
+        let Some(playing) = self.playing.as_mut() else {
+            return;
+        };
+        let result = match self.player.state() {
+            Some(state) if !state.ended => {
+                playing.state = state;
+                let position = playing.position();
+                let moved = position.abs_diff(playing.saved) >= SAVE_EVERY
+                    || (state.paused && position != playing.saved);
+                if moved {
+                    playing.saved = position;
+                    let id = playing.item.id;
+                    self.update_item(id, |i| i.position = position);
+                    backend.set_position(id, position)
+                } else {
+                    Ok(())
+                }
+            }
+            Some(_) => self.finish(backend, true),
+            // The user closed mpv's window.
+            None => self.finish(backend, false),
+        };
+        self.report(result);
+    }
+
+    /// `x`: stops playing, saving the position.
+    pub fn stop(&mut self, backend: &impl Backend) -> Result<()> {
+        if self.playing.is_none() {
+            return Ok(());
+        }
+        if let Some(state) = self.player.state()
+            && let Some(playing) = self.playing.as_mut()
+        {
+            playing.state = state;
+        }
+        let ended = self.playing.as_ref().is_some_and(|p| p.state.ended);
+        self.finish(backend, ended)
+    }
+
+    /// Stops playing. Played to (near) the end, the episode is marked read
+    /// and its position forgotten; otherwise the position is saved.
+    fn finish(&mut self, backend: &impl Backend, ended: bool) -> Result<()> {
+        let Some(playing) = self.playing.take() else {
+            return Ok(());
+        };
+        self.player.stop();
+        let near_end = playing
+            .state
+            .duration
+            .is_some_and(|d| playing.state.position >= d - NEAR_END);
+        let item = &playing.item;
+        if ended || near_end {
+            backend.set_position(item.id, 0)?;
+            self.update_item(item.id, |i| i.position = 0);
+            let read = self
+                .items
+                .iter()
+                .find(|i| i.id == item.id)
+                .map_or(item.read, |i| i.read);
+            if !read {
+                self.set_read(backend, item.id, &item.feed_id, true)?;
+            }
+            self.status = format!("finished {}", item.title);
+        } else {
+            let position = playing.position();
+            backend.set_position(item.id, position)?;
+            self.update_item(item.id, |i| i.position = position);
+            self.status = format!("stopped {}", item.title);
+        }
+        Ok(())
+    }
+
+    fn playing_mut(&mut self) -> Result<&mut Playing> {
+        self.playing
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("nothing is playing"))
+    }
+
+    /// `,` and `.`: seeks back or forward.
+    fn seek(&mut self, by: f64) -> Result<()> {
+        self.playing_mut()?;
+        self.player.seek(by, false)?;
+        let playing = self.playing_mut()?;
+        playing.state.position = (playing.state.position + by).max(0.0);
+        Ok(())
+    }
+
+    /// `]` and `[`: the next chapter, or back to the start of this one (the
+    /// one before, near its start).
+    fn chapter(&mut self, next: bool) -> Result<()> {
+        let playing = self.playing_mut()?;
+        let position = playing.state.position;
+        let mut starts = playing
+            .chapters
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| c.start);
+        let to = if next {
+            starts.find(|s| *s > position + 0.5)
+        } else {
+            Some(starts.rfind(|s| *s < position - 3.0).unwrap_or(0.0))
+        };
+        let Some(to) = to else {
+            self.status = "no more chapters".into();
+            return Ok(());
+        };
+        self.player.seek(to, true)?;
+        self.playing_mut()?.state.position = to;
+        Ok(())
+    }
+
+    /// `+` and `-`: plays faster or slower, from half to three times speed.
+    fn speed(&mut self, by: f64) -> Result<()> {
+        let playing = self.playing_mut()?;
+        let speed = (playing.state.speed + by).clamp(0.5, 3.0);
+        self.player.set_speed(speed)?;
+        self.playing_mut()?.state.speed = speed;
+        self.status = format!("speed {speed}x");
+        Ok(())
+    }
+
+    /// `t` in the reader: shows the episode's transcript, or the text again.
+    fn toggle_transcript(&mut self, backend: &impl Backend) -> Result<()> {
+        let Some(reader) = self.reader.as_mut().filter(|_| self.focus == Pane::Reader) else {
+            return Ok(());
+        };
+        let has = reader
+            .item
+            .media
+            .as_ref()
+            .is_some_and(|m| !m.transcripts.is_empty());
+        if !has {
+            self.status = "no transcript".into();
+            return Ok(());
+        }
+        if reader.transcript.is_none() {
+            reader.transcript = Some(backend.transcript(reader.item.id)?);
+        }
+        reader.show_transcript = !reader.show_transcript;
+        reader.scroll = 0;
+        Ok(())
     }
 
     /// Sets the read flag of the current item, locally and on the server,
@@ -409,8 +733,22 @@ impl App {
             return Ok(());
         };
         let (id, feed_id) = (item.id, item.feed_id.clone());
+        self.set_read(backend, id, &feed_id, read)
+    }
+
+    /// Sets an item's read flag on the server and here.
+    fn set_read(
+        &mut self,
+        backend: &impl Backend,
+        id: i64,
+        feed_id: &str,
+        read: bool,
+    ) -> Result<()> {
         backend.set_read(id, read)?;
         self.update_item(id, |i| i.read = read);
+        if let Some(p) = self.playing.as_mut().filter(|p| p.item.id == id) {
+            p.item.read = read;
+        }
         if let Some(feed) = self.feeds.iter_mut().find(|f| f.id == feed_id) {
             feed.unread = if read {
                 feed.unread.saturating_sub(1)
@@ -525,6 +863,8 @@ mod tests {
             published: 1000 - id,
             read: false,
             starred: false,
+            media: None,
+            position: 0,
         }
     }
 
@@ -560,6 +900,8 @@ mod tests {
                     last_fetched: None,
                     last_error: None,
                     archived: false,
+                    image: None,
+                    medium: None,
                 })
                 .collect())
         }
@@ -678,6 +1020,370 @@ mod tests {
             self.calls.borrow_mut().push("refresh".into());
             Ok(())
         }
+        fn set_position(&self, id: i64, position: u32) -> Result<()> {
+            if self.offline.get() {
+                anyhow::bail!("offline");
+            }
+            self.calls
+                .borrow_mut()
+                .push(format!("position {id} {position}"));
+            Ok(())
+        }
+        fn chapters(&self, id: i64) -> Result<Chapters> {
+            self.calls.borrow_mut().push(format!("chapters {id}"));
+            let chapter = |start: f64, title: &str, hidden| Chapter {
+                start,
+                title: Some(title.into()),
+                hidden,
+                ..Chapter::default()
+            };
+            Ok(Chapters {
+                chapters: vec![
+                    chapter(0.0, "Intro", false),
+                    chapter(60.0, "art", true),
+                    chapter(120.0, "Main", false),
+                    chapter(600.0, "End", false),
+                ],
+            })
+        }
+        fn transcript(&self, id: i64) -> Result<Option<Transcript>> {
+            self.calls.borrow_mut().push(format!("transcript {id}"));
+            Ok(Some(Transcript {
+                segments: vec![pressbox_api::Segment {
+                    start: 0.0,
+                    end: 5.0,
+                    speaker: None,
+                    text: "Hello".into(),
+                }],
+            }))
+        }
+    }
+
+    /// A player that records what it is told, with a state tests set.
+    #[derive(Clone, Default)]
+    struct FakePlayer {
+        calls: std::rc::Rc<RefCell<Vec<String>>>,
+        state: std::rc::Rc<RefCell<Option<PlayerState>>>,
+        broken: std::rc::Rc<std::cell::Cell<bool>>,
+    }
+
+    impl FakePlayer {
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+        fn at(&self, position: f64, paused: bool, ended: bool) {
+            *self.state.borrow_mut() = Some(PlayerState {
+                position,
+                duration: Some(1000.0),
+                paused,
+                speed: 1.0,
+                ended,
+            });
+        }
+    }
+
+    impl Player for FakePlayer {
+        fn load(&mut self, url: &str, title: &str, start: u32, video: bool) -> Result<()> {
+            if self.broken.get() {
+                anyhow::bail!("no mpv");
+            }
+            self.calls
+                .borrow_mut()
+                .push(format!("load {url} {title:?} {start} {video}"));
+            self.at(f64::from(start), false, false);
+            Ok(())
+        }
+        fn state(&mut self) -> Option<PlayerState> {
+            *self.state.borrow()
+        }
+        fn toggle_pause(&mut self) -> Result<()> {
+            self.calls.borrow_mut().push("pause".into());
+            Ok(())
+        }
+        fn seek(&mut self, seconds: f64, absolute: bool) -> Result<()> {
+            self.calls
+                .borrow_mut()
+                .push(format!("seek {seconds} {absolute}"));
+            if let Some(state) = self.state.borrow_mut().as_mut() {
+                state.position = if absolute {
+                    seconds
+                } else {
+                    (state.position + seconds).max(0.0)
+                };
+            }
+            Ok(())
+        }
+        fn set_speed(&mut self, speed: f64) -> Result<()> {
+            self.calls.borrow_mut().push(format!("speed {speed}"));
+            Ok(())
+        }
+        fn stop(&mut self) {
+            self.calls.borrow_mut().push("stop".into());
+            *self.state.borrow_mut() = None;
+        }
+    }
+
+    /// Item 1 is an episode with audio, video, chapters and a transcript,
+    /// started at 100s; item 4 has only audio.
+    fn podcast() -> (Fake, App, FakePlayer) {
+        use pressbox_api::{Enclosure, Media, TranscriptFile};
+        let fake = Fake::new();
+        let enclosure = |url: &str, mime: &str| Enclosure {
+            url: url.into(),
+            mime: Some(mime.into()),
+            ..Enclosure::default()
+        };
+        {
+            let mut items = fake.items.borrow_mut();
+            items[0].media = Some(Media {
+                enclosures: vec![
+                    enclosure("https://x/1.mp3", "audio/mpeg"),
+                    enclosure("https://x/1.mp4", "video/mp4"),
+                ],
+                duration: Some(1000),
+                chapters: Some("https://x/1.json".into()),
+                transcripts: vec![TranscriptFile {
+                    url: "https://x/1.vtt".into(),
+                    mime: "text/vtt".into(),
+                    ..TranscriptFile::default()
+                }],
+                ..Media::default()
+            });
+            items[0].position = 100;
+            let mut audio = item(4, "b");
+            audio.media = Some(Media {
+                enclosures: vec![enclosure("https://x/4.mp3", "audio/mpeg")],
+                ..Media::default()
+            });
+            items.push(audio);
+        }
+        let player = FakePlayer::default();
+        let mut app = App::new();
+        app.player = Box::new(player.clone());
+        app.reload(&fake);
+        app.focus = Pane::Items;
+        (fake, app, player)
+    }
+
+    #[test]
+    fn plays_resumes_and_saves_the_position() {
+        let (fake, mut app, player) = podcast();
+        keys(&mut app, &fake, "p");
+        assert_eq!(
+            player.calls(),
+            ["load https://x/1.mp3 \"item 1\" 100 false"]
+        );
+        assert_eq!(app.status, "playing item 1");
+        let playing = app.playing.as_ref().unwrap();
+        assert_eq!(playing.chapters.len(), 4, "chapters fetched for the list");
+        assert_eq!(playing.chapter().unwrap().title.as_deref(), Some("Intro"));
+
+        // A tick follows the player; the position is saved every 15s.
+        player.at(110.0, false, false);
+        app.tick(&fake);
+        assert_eq!(app.playing.as_ref().unwrap().state.position, 110.0);
+        player.at(130.0, false, false);
+        app.tick(&fake);
+        assert_eq!(app.items[0].position, 130);
+        assert_eq!(
+            app.playing
+                .as_ref()
+                .unwrap()
+                .chapter()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Main")
+        );
+
+        // Pausing saves at once (on the next tick).
+        keys(&mut app, &fake, "p");
+        assert!(app.playing.as_ref().unwrap().state.paused);
+        player.at(131.0, true, false);
+        app.tick(&fake);
+        app.tick(&fake);
+        keys(&mut app, &fake, "p");
+        assert!(!app.playing.as_ref().unwrap().state.paused);
+
+        // Stopping saves where it was, and the episode stays unread.
+        keys(&mut app, &fake, "x");
+        assert_eq!(app.status, "stopped item 1");
+        assert!(app.playing.is_none());
+        assert!(!app.items[0].read);
+        let calls = fake.calls.borrow().clone();
+        assert_eq!(
+            calls,
+            [
+                "chapters 1",
+                "position 1 130",
+                "position 1 131",
+                "position 1 131",
+            ]
+        );
+        assert_eq!(player.calls()[1..], ["pause", "pause", "stop"]);
+        keys(&mut app, &fake, "x");
+        assert_eq!(app.status, "", "nothing to stop");
+    }
+
+    #[test]
+    fn finishing_marks_read_and_forgets_the_position() {
+        let (fake, mut app, player) = podcast();
+        keys(&mut app, &fake, "p");
+        player.at(1000.0, true, true);
+        app.tick(&fake);
+        assert_eq!(app.status, "finished item 1");
+        assert!(app.playing.is_none());
+        assert!(app.items[0].read);
+        assert_eq!(app.items[0].position, 0);
+        assert_eq!(fake.calls.borrow()[1..], ["position 1 0", "read 1 true"]);
+
+        // Played to the end before: it starts again from the top.
+        app.items[0].position = 990;
+        keys(&mut app, &fake, "p");
+        assert!(player.calls().last().unwrap().ends_with(" 0 false"));
+        // Stopped near the end counts as finished; already read stays so.
+        player.at(980.0, false, false);
+        keys(&mut app, &fake, "x");
+        assert_eq!(app.status, "finished item 1");
+        assert_eq!(fake.calls.borrow().last().unwrap(), "position 1 0");
+
+        // Closing mpv's window part way through saves the position.
+        keys(&mut app, &fake, "p");
+        player.at(200.0, false, false);
+        app.tick(&fake);
+        *player.state.borrow_mut() = None;
+        app.tick(&fake);
+        assert_eq!(app.status, "stopped item 1");
+        assert_eq!(fake.calls.borrow().last().unwrap(), "position 1 200");
+        app.tick(&fake);
+    }
+
+    #[test]
+    fn seeking_chapters_speed_and_video() {
+        let (fake, mut app, player) = podcast();
+        for key in ",.[]+-".chars() {
+            keys(&mut app, &fake, &key.to_string());
+            assert_eq!(app.status, "error: nothing is playing", "{key}");
+        }
+        keys(&mut app, &fake, "p");
+        keys(&mut app, &fake, ".");
+        assert_eq!(app.playing.as_ref().unwrap().state.position, 130.0);
+        keys(&mut app, &fake, ",,,,,,,,,,,,,,,");
+        assert_eq!(
+            app.playing.as_ref().unwrap().state.position,
+            0.0,
+            "not before 0"
+        );
+        keys(&mut app, &fake, "]");
+        assert_eq!(
+            app.playing.as_ref().unwrap().state.position,
+            120.0,
+            "hidden ones skipped"
+        );
+        keys(&mut app, &fake, "]]");
+        assert_eq!(app.status, "no more chapters");
+        keys(&mut app, &fake, "[");
+        assert_eq!(
+            app.playing.as_ref().unwrap().state.position,
+            120.0,
+            "start of this one"
+        );
+        app.playing.as_mut().unwrap().state.position = 121.0;
+        keys(&mut app, &fake, "[");
+        assert_eq!(
+            app.playing.as_ref().unwrap().state.position,
+            0.0,
+            "near its start: back one"
+        );
+        keys(&mut app, &fake, "++++++++++");
+        assert_eq!(app.status, "speed 3x");
+        keys(&mut app, &fake, "-");
+        assert_eq!(app.playing.as_ref().unwrap().state.speed, 2.75);
+        assert!(player.calls().contains(&"seek 600 true".to_owned()));
+        assert!(player.calls().contains(&"speed 2.75".to_owned()));
+
+        // V switches to the video.
+        keys(&mut app, &fake, "V");
+        assert_eq!(
+            player.calls().last().unwrap(),
+            "load https://x/1.mp4 \"item 1\" 0 true"
+        );
+        assert!(app.playing.as_ref().unwrap().video);
+        keys(&mut app, &fake, "V");
+        assert_eq!(player.calls().last().unwrap(), "pause");
+
+        // An audio-only episode has no video; items without media can't play.
+        keys(&mut app, &fake, "jjj");
+        keys(&mut app, &fake, "V");
+        assert_eq!(app.status, "this episode has no video");
+        keys(&mut app, &fake, "k");
+        keys(&mut app, &fake, "p");
+        assert_eq!(app.status, "nothing to play here");
+        keys(&mut app, &fake, "jp");
+        assert_eq!(app.status, "playing item 4");
+        assert!(app.playing.as_ref().unwrap().chapters.is_empty());
+    }
+
+    #[test]
+    fn the_reader_shows_chapters_and_transcripts() {
+        let (fake, mut app, player) = podcast();
+        keys(&mut app, &fake, "\n");
+        assert_eq!(app.focus, Pane::Reader);
+        let reader = app.reader.as_ref().unwrap();
+        assert_eq!(reader.chapters.len(), 4);
+        assert!(!reader.item.read, "episodes are read once played through");
+
+        keys(&mut app, &fake, "t");
+        let reader = app.reader.as_ref().unwrap();
+        assert!(reader.show_transcript);
+        assert_eq!(
+            reader.transcript.clone().unwrap().unwrap().segments[0].text,
+            "Hello"
+        );
+        keys(&mut app, &fake, "tt");
+        assert_eq!(
+            fake.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("transcript"))
+                .count(),
+            1,
+            "fetched once"
+        );
+
+        // Playing from the reader uses the chapters it has.
+        keys(&mut app, &fake, "p");
+        assert_eq!(
+            fake.calls
+                .borrow()
+                .iter()
+                .filter(|c| c.starts_with("chapters"))
+                .count(),
+            1
+        );
+        assert_eq!(player.calls().len(), 1);
+
+        // Items without a transcript, and `t` outside the reader.
+        keys(&mut app, &fake, "h");
+        keys(&mut app, &fake, "t");
+        keys(&mut app, &fake, "jjj\n");
+        keys(&mut app, &fake, "t");
+        assert_eq!(app.status, "no transcript");
+
+        // A player that can't start says so.
+        player.broken.set(true);
+        keys(&mut app, &fake, "p");
+        assert_eq!(app.status, "error: no mpv");
+    }
+
+    #[test]
+    fn saving_failures_are_reported() {
+        let (fake, mut app, player) = podcast();
+        keys(&mut app, &fake, "p");
+        fake.offline.set(true);
+        player.at(500.0, false, false);
+        app.tick(&fake);
+        assert_eq!(app.status, "error: offline");
     }
 
     fn keys(app: &mut App, fake: &Fake, keys: &str) {

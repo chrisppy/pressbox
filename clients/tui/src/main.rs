@@ -5,7 +5,7 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -14,6 +14,7 @@ use ratatui::crossterm::event::{self, Event, KeyEventKind};
 
 mod app;
 mod client;
+mod player;
 #[cfg(test)]
 mod test_server;
 mod ui;
@@ -226,13 +227,25 @@ fn run(args: Args) -> Result<()> {
     }
 
     let mut app = App::new();
+    app.player = Box::new(player::Mpv::new(config.player.as_deref().unwrap_or("mpv")));
     app.reload(&client);
-    ratatui::run(|terminal| -> Result<()> {
+    let result = ratatui::run(|terminal| -> Result<()> {
+        let mut reloaded = Instant::now();
+        let mut ticked = Instant::now();
         loop {
+            // While playing, follow the player about once a second.
+            if app.playing.is_some() && ticked.elapsed() >= TICK {
+                app.tick(&client);
+                ticked = Instant::now();
+            }
             terminal.draw(|frame| ui::draw(frame, &app))?;
-            if !event::poll(Duration::from_secs(60))? {
+            let wait = if app.playing.is_some() { TICK } else { IDLE };
+            if !event::poll(wait)? {
                 // Idle for a minute: pick up whatever the server fetched.
-                app.reload(&client);
+                if reloaded.elapsed() >= IDLE {
+                    app.reload(&client);
+                    reloaded = Instant::now();
+                }
                 continue;
             }
             let Event::Key(key) = event::read()? else {
@@ -247,8 +260,16 @@ fn run(args: Args) -> Result<()> {
                 Action::Open(url) => open(OPENER, &url, &mut app),
             }
         }
-    })
+    });
+    // Saves where playback stopped.
+    app.stop(&client)?;
+    result
 }
+
+/// How often the player is followed while playing, and how long the app
+/// waits idle before reloading.
+const TICK: Duration = Duration::from_secs(1);
+const IDLE: Duration = Duration::from_secs(60);
 
 /// What opens a link in the browser.
 const OPENER: &str = if cfg!(target_os = "macos") {
@@ -289,6 +310,7 @@ mod tests {
         let config = ClientConfig {
             server: Some("https://from.config".into()),
             token_file: Some("/config/token".into()),
+            player: None,
         };
         assert_eq!(
             settings(None, None, &config).unwrap(),
