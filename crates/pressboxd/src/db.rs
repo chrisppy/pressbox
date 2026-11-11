@@ -200,6 +200,13 @@ const MIGRATIONS: &[&str] = &[
         fetched INTEGER NOT NULL
     );
     ",
+    // 8: fetch every feed in full once, and soon. Items stored before 7 have
+    // no media, and a feed only gets read again when it changes: most
+    // podcast hosts answer the cached ETag with 304, which would leave
+    // existing episodes without their audio until the next one comes out.
+    r"
+    UPDATE sources SET etag = NULL, last_modified = NULL, next_fetch = 0;
+    ",
 ];
 
 /// An entry parsed (and sanitized) from a feed, ready to store.
@@ -2239,6 +2246,31 @@ mod tests {
             error.to_string(),
             "database is inconsistent after migrating (table item_state)"
         );
+    }
+
+    #[test]
+    fn migration_8_fetches_every_feed_in_full() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..7] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 7).unwrap();
+        conn.execute(
+            "INSERT INTO sources (url, etag, last_modified, next_fetch)
+             VALUES ('https://pod.example/', '\"v1\"', 'Tue, 03 Nov 2026 10:00:00 GMT', 9999)",
+            [],
+        )
+        .unwrap();
+        let db = Db::init(conn).unwrap();
+        let row: (Option<String>, Option<String>, i64) = db
+            .conn
+            .query_row(
+                "SELECT etag, last_modified, next_fetch FROM sources",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, 0));
     }
 
     #[test]

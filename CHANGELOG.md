@@ -30,7 +30,9 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
   file and best transcript (JSON, WebVTT, SRT, HTML or text) into one JSON shape
   each, so clients don't parse them; files are kept for a week.
 
-- Database migration 7 adds the columns and a table for those files.
+- Database migration 7 adds the columns and a table for those files, and 8
+  fetches every feed in full once, so episodes stored before the upgrade get
+  their media.
 
 - Item lists page by cursor: `GET /api/v1/items` takes `cursor` and returns
   `next_cursor`, which stays fast deep into a list (a page after 4,900 items:
