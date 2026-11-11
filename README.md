@@ -9,12 +9,13 @@ SPDX-License-Identifier: GPL-3.0-only
 
 A self-hosted RSS/Atom/JSON Feed aggregator. You declare feeds (and the people
 using them) in your NixOS configuration, a small Rust server polls them, and
-terminal and desktop clients on NixOS, an [iPhone, iPad and Mac
-app](https://github.com/chrisppy/pressbox-darwin) and an [Android
-app](https://github.com/chrisppy/pressbox-android) share read and starred state
-through its API. Each client is paired with a short code; there is no website
-and no shared secret. [Birdland](https://github.com/chrisppy/birdland)'s bar can
-show the unread count.
+terminal and desktop clients on NixOS, an
+[iPhone, iPad and Mac app](https://github.com/chrisppy/pressbox-darwin) and an
+[Android app](https://github.com/chrisppy/pressbox-android) share read and
+starred state through its API. Each client is paired with a short code; there is
+no website and no shared secret.
+[Birdland](https://github.com/chrisppy/birdland)'s bar can show the unread
+count.
 
 > [!NOTE]
 > pressbox is in its early days. Expect rough edges, and configuration and
@@ -29,7 +30,7 @@ NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items
 ```
 
 | Part | Path | What it is |
-| ------------------- | -------------------------------------------------------- | ------------------------------------- |
+| ------------------- | ---------------------------------------------------------------- | --------------------------------------------------- |
 | `pressboxd` | `crates/pressboxd` | Server: polling, storage, search, API |
 | `pressboxctl` | `crates/pressboxd/src/bin` | Pairing, devices, backups, OPML |
 | `pressbox-api` | `crates/pressbox-api` | JSON types shared by the Rust crates |
