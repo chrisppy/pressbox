@@ -13,6 +13,9 @@ all-features = true
 # Anything else fails CI until someone checks it and adds it here.
 allow = [
   "Apache-2.0",
+  # target-lexicon, via system-deps, which the GStreamer and GLib -sys
+  # crates build with (pressbox-iced only).
+  "Apache-2.0 WITH LLVM-exception",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "BSL-1.0",
