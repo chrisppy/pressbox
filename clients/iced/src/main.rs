@@ -6,6 +6,8 @@
 mod api;
 mod app;
 mod config;
+mod controls;
+mod player;
 #[cfg(test)]
 mod test_server;
 mod theme;

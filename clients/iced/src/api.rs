@@ -8,8 +8,8 @@
 use std::time::Duration;
 
 use pressbox_api::{
-    ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, Me, PairApproved, PairRequest,
-    PairStart, Updated, Version,
+    ApproveRequest, Approved, Chapters, Feed, Flag, Item, ItemPage, ItemQuery, Me, PairApproved,
+    PairRequest, PairStart, Position, Transcript, Updated, Version,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -106,6 +106,38 @@ impl Client {
             .request(Method::PUT, &format!("/api/v1/items/{id}/starred"))
             .json(&Flag { value });
         Self::send(req).await.map(drop)
+    }
+
+    /// Saves where playback of an item's media stopped, in seconds.
+    pub async fn set_position(self, id: i64, position: u32) -> Result<()> {
+        let req = self
+            .request(Method::PUT, &format!("/api/v1/items/{id}/position"))
+            .json(&Position { position });
+        Self::send(req).await.map(drop)
+    }
+
+    /// An item's chapters; none if it has no chapters file.
+    pub async fn chapters(self, id: i64) -> Result<Chapters> {
+        let req = self.request(Method::GET, &format!("/api/v1/items/{id}/chapters"));
+        Ok(Self::optional(req).await?.unwrap_or_default())
+    }
+
+    /// An item's transcript; `None` if it has none.
+    pub async fn transcript(self, id: i64) -> Result<Option<Transcript>> {
+        Self::optional(self.request(Method::GET, &format!("/api/v1/items/{id}/transcript"))).await
+    }
+
+    /// JSON, or `None` for a 404.
+    async fn optional<T: DeserializeOwned>(req: RequestBuilder) -> Result<Option<T>> {
+        let resp = req.send().await.map_err(describe)?;
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let resp = match resp.status() {
+            s if s.is_success() => resp,
+            s => return Err(format!("server returned {s}")),
+        };
+        resp.json().await.map(Some).map_err(describe)
     }
 
     pub async fn mark_feed_read(self, feed: String) -> Result<u32> {
@@ -210,6 +242,54 @@ mod tests {
                     .to_owned()
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn podcast_routes() {
+        let (base, requests) = server(vec![
+            (204, ""),
+            (200, r#"{"chapters":[{"start":0.0,"title":"Intro"}]}"#),
+            (404, "{}"),
+            (200, r#"{"segments":[{"start":0.0,"end":1.0,"text":"Hi"}]}"#),
+            (404, "{}"),
+            (502, "{}"),
+        ]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        client.clone().set_position(7, 95).await.unwrap();
+        let chapters = client.clone().chapters(7).await.unwrap();
+        assert_eq!(chapters.chapters[0].title.as_deref(), Some("Intro"));
+        assert!(
+            client
+                .clone()
+                .chapters(8)
+                .await
+                .unwrap()
+                .chapters
+                .is_empty()
+        );
+        let transcript = client.clone().transcript(7).await.unwrap().unwrap();
+        assert_eq!(transcript.segments[0].text, "Hi");
+        assert_eq!(client.clone().transcript(8).await.unwrap(), None);
+        assert_eq!(
+            client.clone().transcript(9).await.unwrap_err(),
+            "server returned 502 Bad Gateway"
+        );
+        assert_eq!(
+            lines(&requests, 6),
+            [
+                "put /api/v1/items/7/position",
+                "get /api/v1/items/7/chapters",
+                "get /api/v1/items/8/chapters",
+                "get /api/v1/items/7/transcript",
+                "get /api/v1/items/8/transcript",
+                "get /api/v1/items/9/transcript",
+            ]
+        );
+        let offline = Client::new("http://127.0.0.1:9", None).unwrap();
+        assert_eq!(
+            offline.transcript(1).await.unwrap_err(),
+            "could not connect to the server"
+        );
     }
 
     #[tokio::test]

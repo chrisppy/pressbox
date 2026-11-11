@@ -7,12 +7,13 @@
 use chrono::{Local, TimeZone};
 use iced::{
     Alignment, Element, Fill, Font, Length, Theme,
-    widget::{button, column, container, row, rule, scrollable, space, text, text_input},
+    widget::{button, column, container, row, rule, scrollable, slider, space, text, text_input},
 };
-use pressbox_api::Item;
+use pressbox_api::{Chapter, Item, Media, Transcript};
 
 use crate::{
-    app::{App, Flag, Message, Reader, Screen, Setup, Source},
+    app::{App, Flag, Message, Playback, Reader, Screen, Setup, Source},
+    controls,
     theme::Colors,
 };
 
@@ -83,6 +84,9 @@ fn reader_view(reader: &Reader) -> Element<'_, Message> {
     .height(Fill);
 
     let mut page = column![body];
+    if let Some(playback) = &reader.playback {
+        page = page.push(rule::horizontal(1)).push(player_bar(playback));
+    }
     if let Some(banner) = banner(reader) {
         page = page.push(rule::horizontal(1)).push(banner);
     }
@@ -306,6 +310,9 @@ fn item_row<'a>(item: &'a Item, reader: &'a Reader) -> Element<'a, Message> {
             }),
         });
     let mut top = row![title.width(Fill)].spacing(6);
+    if let Some(mark) = media_mark(item, reader) {
+        top = top.push(text(mark).size(13).style(muted));
+    }
     if item.starred {
         top = top.push(text("★").size(14).style(star));
     }
@@ -357,21 +364,253 @@ fn article(reader: &Reader) -> Element<'_, Message> {
     ]
     .spacing(8);
 
-    let body = column![
+    let mut body = column![
         text(&item.title).size(24),
         text(meta.join(" · ")).size(13).style(muted),
         actions,
-        rule::horizontal(1),
-        text(&reader.article_text).size(15).line_height(1.5),
     ]
     .spacing(12)
     .padding(24)
     .max_width(760);
+    let playing = reader
+        .playback
+        .as_ref()
+        .filter(|p| p.item.id == item.id && p.player.is_some())
+        .map(|p| p.state.position);
+    if let Some(media) = &item.media {
+        body = body.push(episode(item, media, reader));
+    }
+    body = body.push(rule::horizontal(1));
+    if reader.show_transcript {
+        body = body.push(transcript(reader.transcript.as_ref(), playing));
+    } else {
+        if let Some(chapters) = chapter_list(&reader.chapters, playing) {
+            body = body.push(chapters);
+        }
+        body = body.push(text(&reader.article_text).size(15).line_height(1.5));
+    }
 
-    scrollable(container(body).center_x(Fill))
+    let article = scrollable(container(body).center_x(Fill))
         .width(Length::Fill)
-        .height(Fill)
-        .into()
+        .height(Fill);
+    with_video(reader, article.into())
+}
+
+/// Video plays above the article, whichever article is open.
+// Not measured: draws GStreamer frames, which only a real player has;
+// tests' players have no video.
+#[cfg(not(tarpaulin_include))]
+fn with_video<'a>(reader: &'a Reader, article: Element<'a, Message>) -> Element<'a, Message> {
+    let Some(video) = reader
+        .playback
+        .as_ref()
+        .and_then(|p| p.player.as_ref())
+        .and_then(|p| p.video())
+    else {
+        return article;
+    };
+    let video = container(
+        iced_video_player::VideoPlayer::new(video)
+            .width(Fill)
+            .height(Fill),
+    )
+    .height(Length::FillPortion(3));
+    column![video, rule::horizontal(1), article].into()
+}
+
+/// The list's mark for an episode: playing, started, or not yet.
+fn media_mark(item: &Item, reader: &Reader) -> Option<&'static str> {
+    item.media.as_ref()?;
+    Some(
+        if reader
+            .playback
+            .as_ref()
+            .is_some_and(|p| p.item.id == item.id)
+        {
+            "▶"
+        } else if item.position > 0 {
+            "◐"
+        } else {
+            "♪"
+        },
+    )
+}
+
+/// `m:ss`, or `h:mm:ss` from an hour.
+pub fn clock(seconds: f64) -> String {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let s = seconds.max(0.0) as u64;
+    let (h, m, s) = (s / 3600, s / 60 % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// The episode's facts and its play buttons.
+fn episode<'a>(item: &'a Item, media: &'a Media, reader: &'a Reader) -> Element<'a, Message> {
+    let mut facts = Vec::new();
+    if let Some(d) = media.duration {
+        facts.push(clock(f64::from(d)));
+    }
+    match (media.season, media.episode) {
+        (Some(s), Some(e)) => facts.push(format!("Season {s}, episode {e}")),
+        (None, Some(e)) => facts.push(format!("Episode {e}")),
+        _ => {}
+    }
+    let playing = reader.playback.as_ref().filter(|p| p.item.id == item.id);
+    let play_label = match playing {
+        Some(p) if !p.video && !p.state.paused => "⏸ Pause".to_owned(),
+        Some(p) if !p.video => "▶ Resume".to_owned(),
+        _ if item.position > 0 => format!("▶ Resume from {}", clock(f64::from(item.position))),
+        _ => "▶ Play".to_owned(),
+    };
+    let mut buttons = row![
+        button(text(play_label).size(13))
+            .style(button::primary)
+            .on_press(Message::Play(false))
+    ]
+    .spacing(8);
+    if media.video().is_some() {
+        let label = match playing {
+            Some(p) if p.video && !p.state.paused => "⏸ Pause video",
+            _ => "Watch video",
+        };
+        buttons = buttons.push(
+            button(text(label).size(13))
+                .style(button::secondary)
+                .on_press(Message::Play(true)),
+        );
+    }
+    if !media.transcripts.is_empty() {
+        let label = if reader.show_transcript {
+            "Show text"
+        } else {
+            "Transcript"
+        };
+        buttons = buttons.push(
+            button(text(label).size(13))
+                .style(button::secondary)
+                .on_press(Message::ToggleTranscript),
+        );
+    }
+    let mut part = column![buttons].spacing(6);
+    if !facts.is_empty() {
+        part = part.push(text(facts.join(" · ")).size(13).style(muted));
+    }
+    part.into()
+}
+
+/// The chapters, as buttons that seek when the episode is playing.
+fn chapter_list(chapters: &[Chapter], playing: Option<f64>) -> Option<Element<'_, Message>> {
+    let visible: Vec<_> = chapters.iter().filter(|c| !c.hidden).collect();
+    if visible.is_empty() {
+        return None;
+    }
+    let current = playing.and_then(|at| visible.iter().rposition(|c| c.start <= at));
+    let mut list = column![text("Chapters").size(15)].spacing(2);
+    for (i, chapter) in visible.into_iter().enumerate() {
+        let title = chapter.title.as_deref().unwrap_or_default();
+        let label = row![
+            text(clock(chapter.start)).size(13).style(muted).width(64),
+            text(title).size(13),
+        ];
+        let now = current == Some(i);
+        list = list.push(
+            button(label)
+                .width(Fill)
+                .padding([3, 6])
+                .style(move |theme, status| row_style(theme, status, now))
+                .on_press_maybe(playing.map(|_| Message::SeekTo(chapter.start))),
+        );
+    }
+    Some(list.into())
+}
+
+/// The transcript, a segment a row, the one being heard highlighted.
+fn transcript(
+    transcript: Option<&Option<Transcript>>,
+    playing: Option<f64>,
+) -> Element<'_, Message> {
+    let segments = match transcript {
+        None => return text("Loading the transcript…").style(muted).into(),
+        Some(None) => return text("No transcript.").style(muted).into(),
+        Some(Some(t)) => &t.segments,
+    };
+    let mut list = column![].spacing(2);
+    for segment in segments {
+        let mut line = row![text(clock(segment.start)).size(13).style(muted).width(64)];
+        if let Some(speaker) = &segment.speaker {
+            line = line.push(text(format!("{speaker}: ")).size(14).font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            }));
+        }
+        line = line.push(text(&segment.text).size(14).line_height(1.4).width(Fill));
+        let now = playing.is_some_and(|at| segment.start <= at && at < segment.end);
+        list = list.push(
+            button(line)
+                .width(Fill)
+                .padding([3, 6])
+                .style(move |theme, status| row_style(theme, status, now))
+                .on_press_maybe(playing.map(|_| Message::SeekTo(segment.start))),
+        );
+    }
+    list.into()
+}
+
+/// The bar along the bottom while an episode plays.
+fn player_bar(playback: &Playback) -> Element<'_, Message> {
+    let state = &playback.state;
+    let loading = playback.player.is_none();
+    let control = |label: String, message: Message| {
+        button(text(label).size(13))
+            .style(button::text)
+            .on_press_maybe((!loading).then_some(message))
+    };
+    let mut title = playback.item.title.clone();
+    if let Some(chapter) = playback.chapter().and_then(|c| c.title.as_ref()) {
+        title = format!("{title} · {chapter}");
+    }
+    if loading {
+        title = format!("{title} (loading…)");
+    }
+    let position = playback.scrubbing.unwrap_or(state.position);
+    let duration = state.duration.unwrap_or(position.max(1.0));
+    let time = match state.duration {
+        Some(d) => format!("{} / {}", clock(position), clock(d)),
+        None => clock(position),
+    };
+    let progress = slider(0.0..=duration, position, Message::Scrub)
+        .on_release(Message::ScrubDone)
+        .width(Fill);
+    row![
+        control("⏮".into(), Message::Chapter(false)),
+        control("−10".into(), Message::SeekBy(-controls::BACK)),
+        control(
+            if state.paused { "▶" } else { "⏸" }.into(),
+            Message::PauseToggle
+        ),
+        control("+30".into(), Message::SeekBy(controls::FORWARD)),
+        control("⏭".into(), Message::Chapter(true)),
+        column![
+            text(title).size(13),
+            row![progress, text(time).size(12).style(muted)]
+                .spacing(8)
+                .align_y(Alignment::Center),
+        ]
+        .spacing(2)
+        .width(Fill),
+        control(format!("{}×", state.speed), Message::NextSpeed),
+        button(text("■").size(13))
+            .style(button::text)
+            .on_press(Message::Stop),
+    ]
+    .spacing(4)
+    .padding([6, 12])
+    .align_y(Alignment::Center)
+    .into()
 }
 
 fn date(unix: i64) -> String {
@@ -705,5 +944,233 @@ mod tests {
         assert_eq!(date(now).len(), 5, "like 14:05");
         assert!(date(1_793_700_000).ends_with(", 2026"));
         assert_eq!(date(i64::MAX), "");
+    }
+
+    /// Whether an element shows every one of `texts`.
+    fn shows(element: Element<'_, Message>, texts: &[&str]) -> bool {
+        let mut ui = simulator(element);
+        texts.iter().all(|t| ui.find(*t).is_ok())
+    }
+
+    fn episode_item(id: i64) -> Item {
+        use pressbox_api::{Enclosure, TranscriptFile};
+        let mut episode = item(id, false, false);
+        episode.media = Some(Media {
+            enclosures: vec![
+                Enclosure {
+                    url: "https://a.example/1.mp3".into(),
+                    mime: Some("audio/mpeg".into()),
+                    ..Enclosure::default()
+                },
+                Enclosure {
+                    url: "https://a.example/1.mp4".into(),
+                    mime: Some("video/mp4".into()),
+                    ..Enclosure::default()
+                },
+            ],
+            duration: Some(3723),
+            season: Some(2),
+            episode: Some(10),
+            transcripts: vec![TranscriptFile::default()],
+            ..Media::default()
+        });
+        episode
+    }
+
+    fn chapters() -> Vec<Chapter> {
+        let chapter = |start: f64, title: Option<&str>, hidden| Chapter {
+            start,
+            title: title.map(Into::into),
+            hidden,
+            ..Chapter::default()
+        };
+        vec![
+            chapter(0.0, Some("Intro"), false),
+            chapter(30.0, Some("art"), true),
+            chapter(60.0, Some("News"), false),
+            chapter(4000.0, None, false),
+        ]
+    }
+
+    fn playback(item: Item, paused: bool, video: bool, loaded: bool) -> Playback {
+        let state = crate::player::PlayerState {
+            position: 70.0,
+            duration: Some(3723.0),
+            paused,
+            speed: 1.5,
+            ended: false,
+        };
+        let mut p = Playback::new(item, chapters(), state, video);
+        p.player = loaded.then(|| crate::player::tests::Fake::default().boxed());
+        p
+    }
+
+    #[test]
+    fn episodes_show_their_controls() {
+        let mut reader = reader();
+        let mut started = episode_item(1);
+        started.position = 65;
+        reader.items = vec![started.clone(), episode_item(3), item(2, true, false)];
+        reader.article = Some(started.clone());
+        reader.selected = Some(1);
+        reader.chapters = chapters();
+        let mut ui = simulator(article(&reader));
+        for shown in [
+            "▶ Resume from 1:05",
+            "Watch video",
+            "Transcript",
+            "1:02:03 · Season 2, episode 10",
+            "Chapters",
+            "Intro",
+            "News",
+            "1:06:40",
+        ] {
+            assert!(ui.find(shown).is_ok(), "{shown}");
+        }
+        assert!(ui.find("art").is_err(), "hidden chapters aren't listed");
+        ui.click("▶ Resume from 1:05").unwrap();
+        ui.click("Watch video").unwrap();
+        ui.click("Transcript").unwrap();
+        let _ = ui.click("News");
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert!(
+            matches!(
+                &messages[..],
+                [
+                    Message::Play(false),
+                    Message::Play(true),
+                    Message::ToggleTranscript
+                ]
+            ),
+            "chapters only seek while playing: {messages:?}"
+        );
+        assert!(shows(item_list(&reader), &["◐", "♪"]));
+
+        // Playing it: pause buttons, chapters seek, the list marks it.
+        reader.playback = Some(playback(started.clone(), false, false, true));
+        let mut ui = simulator(article(&reader));
+        assert!(ui.find("⏸ Pause").is_ok());
+        ui.click("News").unwrap();
+        assert!(matches!(
+            ui.into_messages().collect::<Vec<_>>()[..],
+            [Message::SeekTo(60.0)]
+        ));
+        assert!(shows(item_list(&reader), &["▶"]));
+        reader.playback.as_mut().unwrap().state.paused = true;
+        assert!(shows(article(&reader), &["▶ Resume"]));
+        reader.playback = Some(playback(started.clone(), false, true, true));
+        assert!(shows(
+            article(&reader),
+            &["⏸ Pause video", "▶ Resume from 1:05"]
+        ));
+
+        // Fewer facts: no video, no transcript, no numbers.
+        let mut plain = episode_item(4);
+        let media = plain.media.as_mut().unwrap();
+        media.enclosures.truncate(1);
+        media.transcripts.clear();
+        (media.duration, media.season) = (None, None);
+        reader.article = Some(plain.clone());
+        reader.playback = None;
+        reader.chapters.clear();
+        assert!(shows(article(&reader), &["▶ Play", "Episode 10"]));
+        assert!(!shows(article(&reader), &["Watch video"]));
+        assert!(!shows(article(&reader), &["Chapters"]));
+        plain.media.as_mut().unwrap().episode = None;
+        reader.article = Some(plain);
+        assert!(shows(article(&reader), &["▶ Play"]));
+    }
+
+    #[test]
+    fn transcripts_show_who_says_what() {
+        let mut reader = reader();
+        reader.article = Some(episode_item(1));
+        reader.selected = Some(1);
+        reader.show_transcript = true;
+        assert!(shows(
+            article(&reader),
+            &["Loading the transcript…", "Show text"]
+        ));
+        reader.transcript = Some(None);
+        assert!(shows(article(&reader), &["No transcript."]));
+        reader.transcript = Some(Some(Transcript {
+            segments: vec![
+                pressbox_api::Segment {
+                    start: 60.0,
+                    end: 80.0,
+                    speaker: Some("Ann".into()),
+                    text: "Now.".into(),
+                },
+                pressbox_api::Segment {
+                    start: 80.0,
+                    end: 90.0,
+                    speaker: None,
+                    text: "Later.".into(),
+                },
+            ],
+        }));
+        let mut ui = simulator(article(&reader));
+        assert!(ui.find("Ann: ").is_ok() && ui.find("Now.").is_ok());
+        let _ = ui.click("Later.");
+        assert_eq!(ui.into_messages().count(), 0, "not playing: no seeking");
+        reader.playback = Some(playback(episode_item(1), false, false, true));
+        let mut ui = simulator(article(&reader));
+        ui.click("Later.").unwrap();
+        assert!(matches!(
+            ui.into_messages().collect::<Vec<_>>()[..],
+            [Message::SeekTo(80.0)]
+        ));
+    }
+
+    #[test]
+    fn the_player_bar() {
+        let mut p = playback(episode_item(1), false, false, false);
+        let mut ui = simulator(player_bar(&p));
+        assert!(ui.find("Story 1 · News (loading…)").is_ok());
+        let _ = ui.click("⏸");
+        assert_eq!(ui.into_messages().count(), 0, "nothing works while loading");
+
+        p.player = Some(crate::player::tests::Fake::default().boxed());
+        let mut ui = simulator(player_bar(&p));
+        assert!(ui.find("1:10 / 1:02:03").is_ok() && ui.find("1.5×").is_ok());
+        for label in ["⏮", "−10", "⏸", "+30", "⏭", "1.5×", "■"] {
+            ui.click(label).unwrap();
+        }
+        let messages: Vec<_> = ui.into_messages().collect();
+        assert_eq!(
+            format!("{messages:?}"),
+            format!(
+                "{:?}",
+                [
+                    Message::Chapter(false),
+                    Message::SeekBy(-controls::BACK),
+                    Message::PauseToggle,
+                    Message::SeekBy(controls::FORWARD),
+                    Message::Chapter(true),
+                    Message::NextSpeed,
+                    Message::Stop,
+                ]
+            )
+        );
+
+        // Paused, dragging the slider, no duration, no chapter.
+        p.state.paused = true;
+        p.state.duration = None;
+        p.scrubbing = Some(30.0);
+        p.chapters.clear();
+        assert!(shows(player_bar(&p), &["▶", "0:30"]));
+
+        // In the reader, above the banner.
+        let mut reader = reader();
+        reader.playback = Some(p);
+        reader.status = Some("hello".into());
+        assert!(shows(reader_view(&reader), &["Story 1", "hello"]));
+    }
+
+    #[test]
+    fn clocks() {
+        assert_eq!(clock(-5.0), "0:00");
+        assert_eq!(clock(65.9), "1:05");
+        assert_eq!(clock(3723.0), "1:02:03");
     }
 }

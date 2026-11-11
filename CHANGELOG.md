@@ -50,6 +50,12 @@ terminal client share one version number; the HTTP API has its own (the `v1` in
 
 ### Desktop client
 
+- Plays podcasts with GStreamer: audio in the background, video above the
+  article, with a player bar (progress, chapters, skip, speed without pitch
+  change), clickable chapters and a transcript that follows playback. Positions
+  sync with the server and episodes played to the end are marked read. Appears
+  in the system's media controls (MPRIS, macOS Now Playing). The Nix package
+  carries the GStreamer plugins it needs.
 - `pressbox-iced`, a desktop reader built with iced 0.14 (`clients/iced`):
   sources with unread counts (unread, all, starred, tags, feeds), the item list
   with search and paging, and the article with star, read/unread and open in

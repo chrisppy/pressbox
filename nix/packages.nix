@@ -43,13 +43,36 @@ _: {
         nativeCheckInputs = [ pkgs.cacert ];
       };
 
+      # The desktop client plays podcasts with GStreamer: it links the core
+      # and base libraries, and finds the plugins (HTTP sources, demuxers,
+      # decoders, scaletempo for faster playback) through
+      # GST_PLUGIN_SYSTEM_PATH_1_0 at run time.
+      gstLibs = [
+        pkgs.gst_all_1.gstreamer
+        pkgs.gst_all_1.gst-plugins-base
+      ];
+      gstPlugins = gstLibs ++ [
+        pkgs.gst_all_1.gst-plugins-good
+        pkgs.gst_all_1.gst-plugins-bad
+        pkgs.gst_all_1.gst-libav
+      ];
+      gstPluginPath = lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" gstPlugins;
+      # What building (and testing) pressbox-iced needs.
+      gstBuild = {
+        nativeBuildInputs = [ pkgs.pkg-config ];
+        buildInputs = gstLibs;
+      };
+
       # Everything but the desktop client.
       serverArgs = commonArgs // {
         cargoExtraArgs = "--locked --workspace --exclude pressbox-iced";
       };
-      guiArgs = commonArgs // {
-        cargoExtraArgs = "--locked --package pressbox-iced";
-      };
+      guiArgs =
+        commonArgs
+        // gstBuild
+        // {
+          cargoExtraArgs = "--locked --package pressbox-iced";
+        };
 
       cargoArtifacts = craneLib.buildDepsOnly serverArgs;
       guiArtifacts = craneLib.buildDepsOnly guiArgs;
@@ -107,14 +130,21 @@ _: {
           pname = "pressbox-iced";
           cargoArtifacts = guiArtifacts;
 
+          nativeBuildInputs = gstBuild.nativeBuildInputs ++ [ pkgs.makeWrapper ];
+
           postInstall = ''
             install -Dm644 assets/pressbox-iced.desktop -t $out/share/applications
             install -Dm644 assets/logo.svg $out/share/icons/hicolor/scalable/apps/pressbox-iced.svg
           '';
 
-          postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-            patchelf --add-rpath ${lib.makeLibraryPath guiRuntimeLibs} $out/bin/pressbox-iced
-          '';
+          postFixup =
+            lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
+              patchelf --add-rpath ${lib.makeLibraryPath guiRuntimeLibs} $out/bin/pressbox-iced
+            ''
+            + ''
+              wrapProgram $out/bin/pressbox-iced \
+                --prefix GST_PLUGIN_SYSTEM_PATH_1_0 : ${gstPluginPath}
+            '';
 
           meta = {
             description = "Desktop client for pressbox, built with iced";
@@ -127,7 +157,7 @@ _: {
       );
     in
     {
-      _module.args = { inherit guiRuntimeLibs; };
+      _module.args = { inherit guiRuntimeLibs gstLibs gstPluginPath; };
 
       packages = {
         inherit pressboxd pressbox pressbox-iced;
@@ -159,6 +189,7 @@ _: {
         # so it inherits no artifacts.
         coverage = craneLib.cargoTarpaulin (
           commonArgs
+          // gstBuild
           // {
             cargoArtifacts = null;
             doInstallCargoArtifacts = false;
@@ -168,7 +199,7 @@ _: {
             cargoTarpaulinExtraArgs = "--engine llvm --fail-under 100 --skip-clean --out xml --output-dir $out";
             # Tarpaulin runs the tests in the build phase, so the CA bundle
             # (see commonArgs) is needed there.
-            nativeBuildInputs = [ pkgs.cacert ];
+            nativeBuildInputs = gstBuild.nativeBuildInputs ++ [ pkgs.cacert ];
           }
         );
       };

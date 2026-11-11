@@ -21,6 +21,9 @@ allow = [
   "ISC",
   "MIT",
   "MPL-2.0",
+  # libfuzzer-sys, via rav1e (AVIF) in the image crate, which iced's image
+  # feature pulls in for iced_video_player (pressbox-iced only).
+  "NCSA",
   "Unicode-3.0",
   "Zlib",
 ]

@@ -86,7 +86,31 @@ token.
 | `s` | Toggle star |
 | `m` | Toggle read |
 | `o` | Open in browser |
+| `p` / `Space` | Play the episode (or pause / resume it) |
+| `V` | Watch the episode's video |
+| `x` | Stop playing |
+| `,` / `.` | Back 10s / forward 30s |
+| `[` / `]` | Previous / next chapter |
+| `t` | Show the transcript |
 | `Esc` | Dismiss a message |
+
+Podcast episodes are marked `♪` in the list (`◐` once started, `▶` while
+playing), and their article has Play, Watch video and Transcript buttons, the
+duration and season/episode, and the chapters. Audio plays in the background
+through GStreamer; video plays above the article. A bar along the bottom shows
+the episode and chapter, a progress slider, chapter and skip buttons, and the
+speed (click to step through 1×, 1.25×, 1.5×, 1.75×, 2× and 0.75×, without
+raising the pitch). While playing, clicking a chapter or a line of the
+transcript jumps there, and the line being heard is highlighted.
+
+The position is saved on the server every 15 seconds and on pause and stop, so
+playback resumes where you left off on any client, and an episode played to the
+end (or stopped in its last 30 seconds) is marked read. Opening an episode
+doesn't mark it read.
+
+The player shows up in the system's media controls (MPRIS on Linux, Now Playing
+on macOS), so media keys, headphone buttons and Birdland's bar can play, pause
+and seek it; "next" and "previous" skip 30 seconds forward and 10 back.
 
 Colors are [Birdland](https://github.com/chrisppy/base24-themes), and Birdland
 Light when the system is in light mode.

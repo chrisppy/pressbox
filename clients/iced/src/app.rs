@@ -4,16 +4,27 @@
 //! The application: state, messages and updates. The layout is in `ui.rs`.
 
 use iced::{Subscription, Task, Theme, keyboard};
-use pressbox_api::{Feed, Item, ItemPage, ItemQuery, Me, PairApproved, PairStart, Version};
+use pressbox_api::{
+    Chapter, Chapters, Feed, Item, ItemPage, ItemQuery, Me, PairApproved, PairStart, Transcript,
+    Version,
+};
 
 use crate::{
     api::{self, Client},
     config::{self, ClientConfig, Session},
+    controls::{self, MediaKey, Remote},
+    player::{self, Loaded, Player, PlayerState},
     theme,
 };
 
 /// Items fetched per page.
 const PAGE: u32 = 50;
+/// While playing, the position is saved after it moves this many seconds.
+const SAVE_EVERY: u32 = 15;
+/// Stopping this close to the end (seconds) counts as finishing.
+const NEAR_END: f64 = 30.0;
+/// The speeds the speed button steps through.
+pub const SPEEDS: [f64; 6] = [1.0, 1.25, 1.5, 1.75, 2.0, 0.75];
 
 pub struct App {
     pub config: ClientConfig,
@@ -72,6 +83,67 @@ pub struct Reader {
     pub error: Option<String>,
     /// Opens a link in the browser; tests swap it out.
     open_url: fn(&str) -> std::io::Result<()>,
+    /// The open article's chapters, if it has any.
+    pub chapters: Vec<Chapter>,
+    /// The open article's transcript, once loaded; `Some(None)`: none.
+    pub transcript: Option<Option<Transcript>>,
+    /// Showing the transcript instead of the article's text.
+    pub show_transcript: bool,
+    pub playback: Option<Playback>,
+    /// Bumped for each episode loaded, so a late load of an episode since
+    /// replaced (or stopped) is dropped.
+    playback_generation: u64,
+    /// Starts a player; tests swap it out.
+    load_player: player::Loader,
+    /// Connects to the system's media controls; tests swap it out.
+    start_remote: fn() -> Option<Box<dyn Remote>>,
+    remote: Option<Box<dyn Remote>>,
+}
+
+/// The episode playing (or loading).
+pub struct Playback {
+    pub item: Item,
+    pub chapters: Vec<Chapter>,
+    /// As of the last tick.
+    pub state: PlayerState,
+    pub video: bool,
+    /// `None` while it loads.
+    pub player: Option<Box<dyn Player>>,
+    /// Where the progress slider is being dragged to.
+    pub scrubbing: Option<f64>,
+    /// The position last saved on the server.
+    saved: u32,
+}
+
+impl Playback {
+    /// An episode loading.
+    pub fn new(item: Item, chapters: Vec<Chapter>, state: PlayerState, video: bool) -> Self {
+        let mut playback = Self {
+            item,
+            chapters,
+            state,
+            video,
+            player: None,
+            scrubbing: None,
+            saved: 0,
+        };
+        playback.saved = playback.position();
+        playback
+    }
+
+    /// The chapter at the current position, if there are chapters.
+    pub fn chapter(&self) -> Option<&Chapter> {
+        self.chapters
+            .iter()
+            .filter(|c| !c.hidden)
+            .take_while(|c| c.start <= self.state.position)
+            .last()
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn position(&self) -> u32 {
+        self.state.position.max(0.0) as u32
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +185,28 @@ pub enum Message {
     Previous,
     Dismiss,
     SignOut,
+
+    // Podcasts
+    /// Plays the open article's episode (its video, with `true`), or pauses
+    /// or resumes it if it is the one playing.
+    Play(bool),
+    PlayerLoaded(u64, api::Result<Loaded>),
+    PlayerTick,
+    PauseToggle,
+    Stop,
+    SeekBy(f64),
+    SeekTo(f64),
+    /// The progress slider is being dragged; `SeekTo` happens on release.
+    Scrub(f64),
+    ScrubDone,
+    /// The next chapter, or (`false`) back one.
+    Chapter(bool),
+    NextSpeed,
+    ChaptersLoaded(i64, api::Result<Chapters>),
+    ToggleTranscript,
+    TranscriptLoaded(i64, api::Result<Option<Transcript>>),
+    PositionSaved(api::Result<()>),
+    MediaKey(MediaKey),
 
     ThemeMode(iced::theme::Mode),
 }
@@ -195,11 +289,23 @@ impl App {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mode = iced::system::theme_changes().map(Message::ThemeMode);
-        let keys = match self.screen {
-            Screen::Reader(_) => keyboard::listen().filter_map(on_key),
-            Screen::Setup(_) => Subscription::none(),
+        let (keys, playing) = match &self.screen {
+            Screen::Reader(r) => (
+                Subscription::batch([
+                    keyboard::listen().filter_map(on_key),
+                    Subscription::run(controls::keys).map(Message::MediaKey),
+                ]),
+                r.playback.is_some(),
+            ),
+            Screen::Setup(_) => (Subscription::none(), false),
         };
-        Subscription::batch([mode, keys])
+        // While playing, follow the player about once a second.
+        let tick = if playing {
+            iced::time::every(std::time::Duration::from_secs(1)).map(|_| Message::PlayerTick)
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([mode, keys, tick])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -274,6 +380,7 @@ impl App {
             },
             Screen::Reader(reader) => {
                 if let Message::SignOut = message {
+                    let _ = reader.stop();
                     if let Some(path) = self.config.token_path() {
                         let _ = std::fs::remove_file(path);
                     }
@@ -307,6 +414,14 @@ impl Reader {
             status: None,
             error: None,
             open_url: open_in_browser,
+            chapters: Vec::new(),
+            transcript: None,
+            show_transcript: false,
+            playback: None,
+            playback_generation: 0,
+            load_player: player::load,
+            start_remote: controls::start,
+            remote: None,
         }
     }
 
@@ -431,11 +546,353 @@ impl Reader {
             .map(|i| render_html(i.summary.as_deref().unwrap_or_default()))
             .unwrap_or_default();
         let fetch = Task::perform(self.client.clone().item(id), Message::ItemLoaded);
-        let unread = self.item_mut(id).is_some_and(|i| !i.read);
-        if unread {
-            Task::batch([fetch, self.set_flag(id, Flag::Read, true)])
+        self.chapters.clear();
+        self.transcript = None;
+        self.show_transcript = false;
+        let media = self.article.as_ref().and_then(|i| i.media.as_ref());
+        let chapters = if media.is_some_and(|m| m.chapters.is_some()) {
+            Task::perform(self.client.clone().chapters(id), move |r| {
+                Message::ChaptersLoaded(id, r)
+            })
         } else {
-            fetch
+            Task::none()
+        };
+        // An episode isn't read until it is played to the end.
+        let unread = media.is_none() && self.item_mut(id).is_some_and(|i| !i.read);
+        if unread {
+            Task::batch([fetch, chapters, self.set_flag(id, Flag::Read, true)])
+        } else {
+            Task::batch([fetch, chapters])
+        }
+    }
+
+    /// Sets an item's saved position here, in the list and the article.
+    fn set_position_here(&mut self, id: i64, position: u32) {
+        for item in self
+            .items
+            .iter_mut()
+            .chain(self.article.iter_mut())
+            .filter(|i| i.id == id)
+        {
+            item.position = position;
+        }
+    }
+
+    fn save_position(&mut self, id: i64, position: u32) -> Task<Message> {
+        self.set_position_here(id, position);
+        Task::perform(
+            self.client.clone().set_position(id, position),
+            Message::PositionSaved,
+        )
+    }
+
+    /// `Play`: pauses or resumes the episode playing, or starts the open
+    /// article's (its video, with `video`).
+    fn play(&mut self, video: bool) -> Task<Message> {
+        let article = self.article.clone().filter(|i| i.media.is_some());
+        let same = |p: &Playback| article.as_ref().is_none_or(|a| a.id == p.item.id);
+        if self
+            .playback
+            .as_ref()
+            .is_some_and(|p| same(p) && p.video == video)
+        {
+            return self.update(Message::PauseToggle);
+        }
+        let Some(item) = article else {
+            return Task::none();
+        };
+        let media = item.media.clone().unwrap_or_default();
+        let enclosure = if video {
+            media.video()
+        } else {
+            media.audio().or_else(|| media.video())
+        };
+        let Some(enclosure) = enclosure.cloned() else {
+            return Task::none();
+        };
+        let stopped = self.stop();
+        // Stopping may have just saved a newer position (switching between
+        // an episode's audio and video).
+        let position = self
+            .items
+            .iter()
+            .chain(self.article.iter())
+            .find(|i| i.id == item.id)
+            .map_or(item.position, |i| i.position);
+        // Played to the end before: start again.
+        let start = match media.duration {
+            Some(d) if f64::from(position) >= f64::from(d) - NEAR_END => 0,
+            _ => position,
+        };
+        // The episode is the open article's.
+        let chapters = self.chapters.clone();
+        if self.remote.is_none() {
+            self.remote = (self.start_remote)();
+        }
+        if let Some(remote) = self.remote.as_mut() {
+            let feed = self
+                .feeds
+                .iter()
+                .find(|f| f.id == item.feed_id)
+                .map_or(item.feed_id.as_str(), |f| f.title.as_str());
+            let image = media.image.as_deref().or_else(|| {
+                self.feeds
+                    .iter()
+                    .find(|f| f.id == item.feed_id)
+                    .and_then(|f| f.image.as_deref())
+            });
+            remote.now_playing(&item.title, feed, image, media.duration.map(f64::from));
+        }
+        self.playback_generation += 1;
+        let generation = self.playback_generation;
+        let state = PlayerState {
+            position: f64::from(start),
+            duration: media.duration.map(f64::from),
+            paused: false,
+            speed: 1.0,
+            ended: false,
+        };
+        self.playback = Some(Playback::new(item, chapters, state, video));
+        let load = self.load_player;
+        let url = enclosure.url;
+        let loading = Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || load(&url, start, video).map(Loaded::new))
+                    .await
+                    .map_err(|e| e.to_string())?
+            },
+            move |r| Message::PlayerLoaded(generation, r),
+        );
+        Task::batch([stopped, loading])
+    }
+
+    /// Stops playing. Played to (near) the end, the episode is marked read
+    /// and its position forgotten; otherwise the position is saved.
+    fn stop(&mut self) -> Task<Message> {
+        let Some(mut playback) = self.playback.take() else {
+            return Task::none();
+        };
+        if let Some(state) = playback.player.as_mut().and_then(|p| p.state()) {
+            playback.state = state;
+        }
+        // Dropping the player stops it.
+        drop(playback.player.take());
+        if let Some(remote) = self.remote.as_mut() {
+            remote.playback(None);
+        }
+        self.finish(&playback)
+    }
+
+    fn finish(&mut self, playback: &Playback) -> Task<Message> {
+        let state = playback.state;
+        let near_end = state
+            .duration
+            .is_some_and(|d| state.position >= d - NEAR_END);
+        let id = playback.item.id;
+        if state.ended || near_end {
+            let read = self
+                .items
+                .iter()
+                .find(|i| i.id == id)
+                .map_or(playback.item.read, |i| i.read);
+            let saved = self.save_position(id, 0);
+            if read {
+                saved
+            } else {
+                Task::batch([saved, self.set_flag(id, Flag::Read, true)])
+            }
+        } else {
+            self.save_position(id, playback.position())
+        }
+    }
+
+    /// `PlayerTick`: follows the player, saves the position now and then,
+    /// and notices the end.
+    fn tick(&mut self) -> Task<Message> {
+        let Some(playback) = self.playback.as_mut() else {
+            return Task::none();
+        };
+        let Some(player) = playback.player.as_mut() else {
+            // Still loading.
+            return Task::none();
+        };
+        match player.state() {
+            Some(state) if !state.ended => {
+                playback.state = state;
+                if let Some(remote) = self.remote.as_mut() {
+                    remote.playback(Some((state.paused, state.position)));
+                }
+                let position = playback.position();
+                let moved = position.abs_diff(playback.saved) >= SAVE_EVERY
+                    || (state.paused && position != playback.saved);
+                if moved {
+                    playback.saved = position;
+                    let id = playback.item.id;
+                    self.save_position(id, position)
+                } else {
+                    Task::none()
+                }
+            }
+            Some(state) => {
+                playback.state = state;
+                self.stop()
+            }
+            None => {
+                self.error = Some("Playback stopped: the episode couldn't be played.".into());
+                self.stop()
+            }
+        }
+    }
+
+    /// The loaded player, if one is playing.
+    fn player(&mut self) -> Option<(&mut Box<dyn Player>, &mut PlayerState)> {
+        let playback = self.playback.as_mut()?;
+        Some((playback.player.as_mut()?, &mut playback.state))
+    }
+
+    fn seek_to(&mut self, seconds: f64) {
+        if let Some((player, state)) = self.player() {
+            let seconds = match state.duration {
+                Some(d) => seconds.clamp(0.0, d),
+                None => seconds.max(0.0),
+            };
+            player.seek(seconds);
+            state.position = seconds;
+            state.ended = false;
+        }
+    }
+
+    /// The next chapter's start, or (`next` false) this one's, or the one
+    /// before near its start.
+    fn chapter_start(&self, next: bool) -> Option<f64> {
+        let playback = self.playback.as_ref()?;
+        let at = playback.state.position;
+        let mut starts = playback
+            .chapters
+            .iter()
+            .filter(|c| !c.hidden)
+            .map(|c| c.start);
+        if next {
+            starts.find(|s| *s > at + 0.5)
+        } else {
+            Some(starts.rfind(|s| *s < at - 3.0).unwrap_or(0.0))
+        }
+    }
+
+    fn playback_message(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::Play(video) => self.play(video),
+            Message::PlayerLoaded(generation, result) => {
+                if generation != self.playback_generation {
+                    return Task::none();
+                }
+                match result.map(|l| l.take()) {
+                    Ok(Some(player)) => {
+                        if let Some(p) = self.playback.as_mut() {
+                            p.player = Some(player);
+                        }
+                        Task::none()
+                    }
+                    Ok(None) => Task::none(),
+                    Err(e) => {
+                        self.playback = None;
+                        self.error = Some(e);
+                        Task::none()
+                    }
+                }
+            }
+            Message::PlayerTick => self.tick(),
+            Message::PauseToggle => {
+                if let Some((player, state)) = self.player() {
+                    state.paused = !state.paused;
+                    player.set_paused(state.paused);
+                }
+                Task::none()
+            }
+            Message::Stop => self.stop(),
+            Message::SeekBy(by) => {
+                let at = self.playback.as_ref().map(|p| p.state.position);
+                if let Some(at) = at {
+                    self.seek_to(at + by);
+                }
+                Task::none()
+            }
+            Message::SeekTo(to) => {
+                self.seek_to(to);
+                Task::none()
+            }
+            Message::Scrub(to) => {
+                if let Some(p) = self.playback.as_mut() {
+                    p.scrubbing = Some(to);
+                }
+                Task::none()
+            }
+            Message::ScrubDone => {
+                if let Some(to) = self.playback.as_mut().and_then(|p| p.scrubbing.take()) {
+                    self.seek_to(to);
+                }
+                Task::none()
+            }
+            Message::Chapter(next) => {
+                if let Some(to) = self.chapter_start(next) {
+                    self.seek_to(to);
+                }
+                Task::none()
+            }
+            Message::NextSpeed => {
+                if let Some((player, state)) = self.player() {
+                    let i = SPEEDS.iter().position(|s| (s - state.speed).abs() < 0.01);
+                    state.speed = SPEEDS[i.map_or(0, |i| (i + 1) % SPEEDS.len())];
+                    player.set_speed(state.speed);
+                }
+                Task::none()
+            }
+            Message::ChaptersLoaded(id, Ok(chapters)) => {
+                if self.selected == Some(id) {
+                    self.chapters.clone_from(&chapters.chapters);
+                }
+                if let Some(p) = self.playback.as_mut().filter(|p| p.item.id == id) {
+                    p.chapters = chapters.chapters;
+                }
+                Task::none()
+            }
+            Message::ToggleTranscript => {
+                let Some(id) = self.selected else {
+                    return Task::none();
+                };
+                self.show_transcript = !self.show_transcript;
+                if self.show_transcript && self.transcript.is_none() {
+                    return Task::perform(self.client.clone().transcript(id), move |r| {
+                        Message::TranscriptLoaded(id, r)
+                    });
+                }
+                Task::none()
+            }
+            Message::TranscriptLoaded(id, Ok(transcript)) => {
+                if self.selected == Some(id) {
+                    self.transcript = Some(transcript);
+                }
+                Task::none()
+            }
+            Message::ChaptersLoaded(_, Err(e))
+            | Message::TranscriptLoaded(_, Err(e))
+            | Message::PositionSaved(Err(e)) => {
+                self.error = Some(e);
+                Task::none()
+            }
+            Message::MediaKey(key) => {
+                let paused = self.playback.as_ref().map(|p| p.state.paused);
+                match key {
+                    MediaKey::Play if paused == Some(true) => self.update(Message::PauseToggle),
+                    MediaKey::Pause if paused == Some(false) => self.update(Message::PauseToggle),
+                    MediaKey::Toggle => self.update(Message::PauseToggle),
+                    MediaKey::SeekBy(by) => self.update(Message::SeekBy(by)),
+                    MediaKey::SeekTo(to) => self.update(Message::SeekTo(to)),
+                    MediaKey::Stop => self.stop(),
+                    MediaKey::Play | MediaKey::Pause => Task::none(),
+                }
+            }
+            _ => Task::none(),
         }
     }
 
@@ -631,7 +1088,7 @@ impl Reader {
                 self.status = None;
                 Task::none()
             }
-            _ => Task::none(),
+            message => self.playback_message(message),
         }
     }
 }
@@ -661,6 +1118,14 @@ fn on_key(event: keyboard::Event) -> Option<Message> {
         Key::Character("s") => Some(Message::Toggle(Flag::Starred)),
         Key::Character("m") => Some(Message::Toggle(Flag::Read)),
         Key::Character("o") => Some(Message::OpenInBrowser),
+        Key::Character("p") | Key::Named(Named::Space) => Some(Message::Play(false)),
+        Key::Character("V") => Some(Message::Play(true)),
+        Key::Character("x") => Some(Message::Stop),
+        Key::Character(",") => Some(Message::SeekBy(-controls::BACK)),
+        Key::Character(".") => Some(Message::SeekBy(controls::FORWARD)),
+        Key::Character("[") => Some(Message::Chapter(false)),
+        Key::Character("]") => Some(Message::Chapter(true)),
+        Key::Character("t") => Some(Message::ToggleTranscript),
         Key::Named(Named::Escape) => Some(Message::Dismiss),
         _ => None,
     }
@@ -1362,7 +1827,7 @@ mod tests {
             on_key(press(char("j"), Modifiers::CTRL)).is_none(),
             "shortcuts pass"
         );
-        assert!(on_key(press(char("x"), Modifiers::empty())).is_none());
+        assert!(on_key(press(char("z"), Modifiers::empty())).is_none());
         assert!(matches!(
             on_key(press(Key::Named(Named::Escape), Modifiers::empty())),
             Some(Message::Dismiss)
@@ -1377,5 +1842,457 @@ mod tests {
             modifiers: Modifiers::empty(),
         };
         assert!(on_key(release).is_none(), "only presses");
+    }
+
+    thread_local! {
+        /// What the fake media controls were told.
+        static REMOTE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    struct FakeRemote;
+
+    impl Remote for FakeRemote {
+        fn now_playing(&mut self, title: &str, feed: &str, image: Option<&str>, d: Option<f64>) {
+            REMOTE.with(|r| {
+                r.borrow_mut()
+                    .push(format!("{title} / {feed} / {image:?} / {d:?}"))
+            });
+        }
+        fn playback(&mut self, state: Option<(bool, f64)>) {
+            REMOTE.with(|r| r.borrow_mut().push(format!("{state:?}")));
+        }
+    }
+
+    fn remote() -> Vec<String> {
+        REMOTE.with(|r| r.borrow().clone())
+    }
+
+    /// Item 1 is an episode (audio and video, chapters, a transcript, 1000s
+    /// long, started at 100s); item 2 is a post.
+    fn podcast_reader() -> (Reader, crate::player::tests::Fake) {
+        use pressbox_api::{Enclosure, Media, TranscriptFile};
+        REMOTE.with(|r| r.borrow_mut().clear());
+        let mut r = reader();
+        r.start_remote = || Some(Box::new(FakeRemote));
+        r.load_player = |_, _, _| Err("tests load players by hand".into());
+        let mut a = feed("a", 2, &[]);
+        a.image = Some("https://a.example/art.jpg".into());
+        r.feeds = vec![a];
+        let enclosure = |url: &str, mime: &str| Enclosure {
+            url: url.into(),
+            mime: Some(mime.into()),
+            ..Enclosure::default()
+        };
+        let mut episode = item(1, "a");
+        episode.media = Some(Media {
+            enclosures: vec![
+                enclosure("https://a.example/1.mp3", "audio/mpeg"),
+                enclosure("https://a.example/1.mp4", "video/mp4"),
+            ],
+            duration: Some(1000),
+            chapters: Some("https://a.example/1.json".into()),
+            transcripts: vec![TranscriptFile {
+                url: "https://a.example/1.vtt".into(),
+                mime: "text/vtt".into(),
+                ..TranscriptFile::default()
+            }],
+            ..Media::default()
+        });
+        episode.position = 100;
+        r.items = vec![episode, item(2, "a")];
+        (r, crate::player::tests::Fake::default())
+    }
+
+    fn chapters() -> Chapters {
+        let chapter = |start: f64, title: &str, hidden| Chapter {
+            start,
+            title: Some(title.into()),
+            hidden,
+            ..Chapter::default()
+        };
+        Chapters {
+            chapters: vec![
+                chapter(0.0, "Intro", false),
+                chapter(60.0, "art", true),
+                chapter(120.0, "Main", false),
+                chapter(600.0, "End", false),
+            ],
+        }
+    }
+
+    /// Hands the reader its loaded player, as the load task would.
+    fn loaded(r: &mut Reader, fake: &crate::player::tests::Fake) {
+        let generation = r.playback_generation;
+        let _ = r.update(Message::PlayerLoaded(
+            generation,
+            Ok(Loaded::new(fake.boxed())),
+        ));
+        fake.at(r.playback.as_ref().unwrap().state.position, false, false);
+    }
+
+    fn state(r: &Reader) -> PlayerState {
+        r.playback.as_ref().unwrap().state
+    }
+
+    #[test]
+    fn opening_an_episode_loads_chapters_and_leaves_it_unread() {
+        let (mut r, _) = podcast_reader();
+        let _ = r.update(Message::OpenItem(1));
+        assert!(!r.items[0].read, "episodes are read once played through");
+        assert_eq!(r.feeds[0].unread, 2);
+        let _ = r.update(Message::ChaptersLoaded(1, Ok(chapters())));
+        assert_eq!(r.chapters.len(), 4);
+        let _ = r.update(Message::ChaptersLoaded(2, Ok(chapters())));
+        let _ = r.update(Message::ChaptersLoaded(1, Err("502".into())));
+        assert_eq!(r.error.as_deref(), Some("502"));
+
+        // The transcript loads the first time it is shown.
+        let _ = r.update(Message::ToggleTranscript);
+        assert!(r.show_transcript && r.transcript.is_none());
+        let _ = r.update(Message::TranscriptLoaded(1, Ok(None)));
+        assert_eq!(r.transcript, Some(None));
+        let _ = r.update(Message::TranscriptLoaded(2, Ok(None)));
+        let _ = r.update(Message::ToggleTranscript);
+        let _ = r.update(Message::ToggleTranscript);
+        assert!(r.show_transcript);
+
+        // A post: no chapters, read on opening, and a fresh transcript slate.
+        let _ = r.update(Message::OpenItem(2));
+        assert!(r.items[1].read && r.chapters.is_empty() && !r.show_transcript);
+        r.selected = None;
+        let _ = r.update(Message::ToggleTranscript);
+        assert!(!r.show_transcript, "nothing open");
+    }
+
+    #[test]
+    fn plays_resumes_and_saves_the_position() {
+        let (mut r, fake) = podcast_reader();
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::ChaptersLoaded(1, Ok(chapters())));
+        let _ = r.update(Message::Play(false));
+        let p = r.playback.as_ref().unwrap();
+        assert!(p.player.is_none(), "loading");
+        assert_eq!((p.state.position, p.chapters.len()), (100.0, 4));
+        assert_eq!(
+            remote(),
+            ["Item 1 / Feed a / Some(\"https://a.example/art.jpg\") / Some(1000.0)"]
+        );
+        let _ = r.update(Message::PlayerTick);
+        let _ = r.update(Message::PauseToggle);
+        assert!(!state(&r).paused, "nothing to pause while loading");
+
+        // A late load for an earlier episode is dropped.
+        let stale = Loaded::new(fake.boxed());
+        let _ = r.update(Message::PlayerLoaded(0, Ok(stale)));
+        assert!(r.playback.as_ref().unwrap().player.is_none());
+        loaded(&mut r, &fake);
+        let _ = r.update(Message::PlayerLoaded(
+            r.playback_generation,
+            Ok(Loaded::new(fake.boxed())),
+        ));
+        let taken = Loaded::new(fake.boxed());
+        taken.take();
+        let _ = r.update(Message::PlayerLoaded(r.playback_generation, Ok(taken)));
+
+        fake.at(110.0, false, false);
+        let _ = r.update(Message::PlayerTick);
+        assert_eq!(state(&r).position, 110.0);
+        assert_eq!(r.items[0].position, 100, "not saved yet");
+        fake.at(130.0, false, false);
+        let _ = r.update(Message::PlayerTick);
+        assert_eq!(r.items[0].position, 130);
+        assert_eq!(
+            r.playback
+                .as_ref()
+                .unwrap()
+                .chapter()
+                .unwrap()
+                .title
+                .as_deref(),
+            Some("Main")
+        );
+        assert_eq!(remote().last().unwrap(), "Some((false, 130.0))");
+
+        // Pausing (Play on the same episode toggles) saves at the next tick.
+        let _ = r.update(Message::Play(false));
+        assert!(state(&r).paused);
+        fake.at(131.0, true, false);
+        let _ = r.update(Message::PlayerTick);
+        assert_eq!(r.items[0].position, 131);
+        let _ = r.update(Message::PlayerTick);
+
+        // Stopping saves where it was; the episode stays unread.
+        let _ = r.update(Message::Stop);
+        assert!(r.playback.is_none());
+        assert!(!r.items[0].read);
+        assert_eq!(r.items[0].position, 131);
+        assert_eq!(remote().last().unwrap(), "None");
+        assert!(fake.calls().contains(&"stop".to_owned()));
+        let _ = r.update(Message::Stop);
+        let _ = r.update(Message::PlayerTick);
+        let _ = r.update(Message::PositionSaved(Err("offline".into())));
+        assert_eq!(r.error.as_deref(), Some("offline"));
+        let _ = r.update(Message::PositionSaved(Ok(())));
+    }
+
+    #[test]
+    fn seeking_chapters_speed_and_media_keys() {
+        let (mut r, fake) = podcast_reader();
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::ChaptersLoaded(1, Ok(chapters())));
+        // Nothing playing: nothing happens.
+        for m in [
+            Message::SeekBy(5.0),
+            Message::SeekTo(5.0),
+            Message::Scrub(5.0),
+            Message::ScrubDone,
+            Message::Chapter(true),
+            Message::NextSpeed,
+            Message::MediaKey(MediaKey::Play),
+        ] {
+            let _ = r.update(m);
+        }
+        let _ = r.update(Message::Play(false));
+        loaded(&mut r, &fake);
+
+        let _ = r.update(Message::SeekBy(30.0));
+        assert_eq!(state(&r).position, 130.0);
+        let _ = r.update(Message::SeekTo(5000.0));
+        assert_eq!(state(&r).position, 1000.0, "not past the end");
+        let _ = r.update(Message::SeekBy(-5000.0));
+        assert_eq!(state(&r).position, 0.0);
+        let _ = r.update(Message::Scrub(300.0));
+        assert_eq!(state(&r).position, 0.0, "not until released");
+        let _ = r.update(Message::ScrubDone);
+        assert_eq!(state(&r).position, 300.0);
+        let _ = r.update(Message::ScrubDone);
+
+        let _ = r.update(Message::Chapter(true));
+        assert_eq!(state(&r).position, 600.0, "hidden chapters are skipped");
+        let _ = r.update(Message::Chapter(true));
+        assert_eq!(state(&r).position, 600.0, "no more");
+        let _ = r.update(Message::Chapter(false));
+        assert_eq!(state(&r).position, 120.0, "near its start: the one before");
+        let _ = r.update(Message::SeekTo(130.0));
+        let _ = r.update(Message::Chapter(false));
+        assert_eq!(state(&r).position, 120.0, "the start of this one");
+
+        for expected in [1.25, 1.5, 1.75, 2.0, 0.75, 1.0] {
+            let _ = r.update(Message::NextSpeed);
+            assert_eq!(state(&r).speed, expected);
+        }
+        r.playback.as_mut().unwrap().state.speed = 1.1;
+        let _ = r.update(Message::NextSpeed);
+        assert_eq!(state(&r).speed, 1.0, "an odd speed starts over");
+
+        for (key, paused) in [
+            (MediaKey::Pause, true),
+            (MediaKey::Pause, true),
+            (MediaKey::Play, false),
+            (MediaKey::Play, false),
+            (MediaKey::Toggle, true),
+        ] {
+            let _ = r.update(Message::MediaKey(key));
+            assert_eq!(state(&r).paused, paused, "{key:?}");
+        }
+        let _ = r.update(Message::MediaKey(MediaKey::SeekTo(50.0)));
+        let _ = r.update(Message::MediaKey(MediaKey::SeekBy(10.0)));
+        assert_eq!(state(&r).position, 60.0);
+        let _ = r.update(Message::MediaKey(MediaKey::Stop));
+        assert!(r.playback.is_none());
+        assert!(fake.calls().contains(&"speed 1.25".to_owned()));
+    }
+
+    #[test]
+    fn finishing_marks_read_and_switching_to_video_resumes() {
+        let (mut r, fake) = podcast_reader();
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::Play(false));
+        loaded(&mut r, &fake);
+        fake.at(400.0, false, false);
+        let _ = r.update(Message::PlayerTick);
+
+        // The video starts where the audio was.
+        let _ = r.update(Message::Play(true));
+        let p = r.playback.as_ref().unwrap();
+        assert!(p.video && p.player.is_none());
+        assert_eq!(p.state.position, 400.0);
+        loaded(&mut r, &fake);
+
+        // Played to the end: read, and the position forgotten.
+        fake.at(1000.0, false, true);
+        let _ = r.update(Message::PlayerTick);
+        assert!(r.playback.is_none());
+        assert!(r.items[0].read && r.article.as_ref().unwrap().read);
+        assert_eq!((r.items[0].position, r.feeds[0].unread), (0, 1));
+
+        // Played to the end before: from the top. Stopped near the end:
+        // finished, and already read.
+        r.items[0].position = 990;
+        let _ = r.update(Message::Play(false));
+        assert_eq!(state(&r).position, 0.0);
+        loaded(&mut r, &fake);
+        fake.at(980.0, false, false);
+        let _ = r.update(Message::Stop);
+        assert_eq!(r.items[0].position, 0);
+
+        // A player that fails stops with an error; so does a failed load.
+        let _ = r.update(Message::Play(false));
+        loaded(&mut r, &fake);
+        *fake.state.lock().unwrap() = None;
+        let _ = r.update(Message::PlayerTick);
+        assert!(r.playback.is_none());
+        assert!(r.error.as_deref().unwrap().starts_with("Playback stopped"));
+        let _ = r.update(Message::Play(false));
+        let generation = r.playback_generation;
+        let _ = r.update(Message::PlayerLoaded(generation, Err("no codec".into())));
+        assert!(r.playback.is_none());
+        assert_eq!(r.error.as_deref(), Some("no codec"));
+    }
+
+    #[test]
+    fn what_cannot_be_played() {
+        let (mut r, _) = podcast_reader();
+        r.start_remote = || None;
+        let _ = r.update(Message::Play(false));
+        assert!(r.playback.is_none(), "nothing open");
+        let _ = r.update(Message::OpenItem(2));
+        let _ = r.update(Message::Play(false));
+        assert!(r.playback.is_none(), "a post");
+
+        // Audio only: no video to watch, but its audio plays.
+        let _ = r.update(Message::OpenItem(1));
+        let media = r.article.as_mut().unwrap().media.as_mut().unwrap();
+        media.enclosures.truncate(1);
+        media.duration = None;
+        let _ = r.update(Message::Play(true));
+        assert!(r.playback.is_none());
+        let _ = r.update(Message::Play(false));
+        assert!(r.playback.is_some());
+        assert!(r.remote.is_none(), "no media controls on this system");
+        // A feed we don't know is named by its id.
+        r.feeds.clear();
+        r.start_remote = || Some(Box::new(FakeRemote));
+        r.article.as_mut().unwrap().id = 3;
+        r.items[0].id = 3;
+        let _ = r.update(Message::Play(false));
+        assert!(
+            remote()
+                .last()
+                .unwrap()
+                .starts_with("Item 1 / a / None / None")
+        );
+    }
+
+    #[test]
+    fn late_chapters_and_odd_cases() {
+        let (mut r, fake) = podcast_reader();
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::Play(false));
+        loaded(&mut r, &fake);
+        // Chapters that arrive after playing started reach the player too.
+        let _ = r.update(Message::ChaptersLoaded(1, Ok(chapters())));
+        assert_eq!(r.playback.as_ref().unwrap().chapters.len(), 4);
+        // Without a known duration, seeking has no end.
+        r.playback.as_mut().unwrap().state.duration = None;
+        let _ = r.update(Message::SeekTo(5000.0));
+        assert_eq!(state(&r).position, 5000.0);
+        let _ = r.update(Message::TranscriptLoaded(1, Err("502".into())));
+        assert_eq!(r.error.as_deref(), Some("502"));
+    }
+
+    #[tokio::test]
+    async fn podcast_tasks_reach_the_server_and_the_player() {
+        let (base, _requests) = crate::test_server::routed(vec![
+            (
+                "GET /api/v1/items/1/chapters",
+                200,
+                r#"{"chapters":[{"start":0.0}]}"#,
+            ),
+            ("GET /api/v1/items/1/transcript", 200, r#"{"segments":[]}"#),
+            (
+                "GET /api/v1/items/1",
+                200,
+                r#"{"id":1,"feed_id":"a","title":"Item 1","url":null,
+                "author":null,"summary":null,"published":1,"read":false,"starred":false}"#,
+            ),
+            ("PUT /api/v1/items/1/", 204, ""),
+        ]);
+        let (mut r, _fake) = podcast_reader();
+        r.client = Client::new(&base, Some("t".into())).unwrap();
+        r.load_player = |_, _, _| Ok(crate::player::tests::Fake::default().boxed());
+        let opened = run(r.update(Message::OpenItem(1)), 2).await;
+        assert!(
+            opened
+                .iter()
+                .any(|m| matches!(m, Message::ChaptersLoaded(1, Ok(_)))),
+            "{opened:?}"
+        );
+        let shown = run(r.update(Message::ToggleTranscript), 1).await;
+        assert!(matches!(
+            shown[..],
+            [Message::TranscriptLoaded(1, Ok(Some(_)))]
+        ));
+        let playing = run(r.update(Message::Play(false)), 1).await;
+        assert!(matches!(playing[..], [Message::PlayerLoaded(_, Ok(_))]));
+        for message in playing {
+            let _ = r.update(message);
+        }
+        assert!(r.playback.as_ref().unwrap().player.is_some());
+
+        // Playing, the app ticks; the tick saves through the server.
+        let (mut app, dir) = setup_app("podcast-tasks");
+        app.screen = Screen::Reader(Box::new(r));
+        let _ = app.subscription();
+        let saved = run(app.update(Message::Stop), 1).await;
+        assert!(matches!(saved[..], [Message::PositionSaved(Ok(()))]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn signing_out_stops_playback() {
+        let (mut app, dir) = setup_app("signout");
+        let (r, fake) = podcast_reader();
+        app.screen = Screen::Reader(Box::new(r));
+        let _ = app.update(Message::OpenItem(1));
+        let _ = app.update(Message::Play(false));
+        if let Screen::Reader(r) = &mut app.screen {
+            loaded(r, &fake);
+        }
+        let _ = app.update(Message::SignOut);
+        assert!(fake.calls().contains(&"stop".to_owned()));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn media_keys_and_shortcuts() {
+        use keyboard::{Key, Modifiers, key::Named};
+        let press = |key: Key| keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key.clone(),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: Modifiers::default(),
+            text: None,
+            repeat: false,
+        };
+        let cases = [
+            ("p", Message::Play(false)),
+            ("V", Message::Play(true)),
+            ("x", Message::Stop),
+            (",", Message::SeekBy(-controls::BACK)),
+            (".", Message::SeekBy(controls::FORWARD)),
+            ("[", Message::Chapter(false)),
+            ("]", Message::Chapter(true)),
+            ("t", Message::ToggleTranscript),
+        ];
+        for (key, expected) in cases {
+            let got = on_key(press(Key::Character(key.into())));
+            assert_eq!(format!("{got:?}"), format!("{:?}", Some(expected)), "{key}");
+        }
+        let space = on_key(press(Key::Named(Named::Space)));
+        assert!(matches!(space, Some(Message::Play(false))));
     }
 }
