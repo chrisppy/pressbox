@@ -12,7 +12,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     devfmt = {
-      url = "github:chrisppy/devfmt";
+      url = "github:red-oxide/devfmt";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
