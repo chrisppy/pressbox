@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
 // SPDX-License-Identifier: GPL-3.0-only
 
-//! Birdland colors, from https://github.com/chrisppy/base24-themes: Birdland
+//! Birdland colors, from https://github.com/red-oxide/base24-themes: Birdland
 //! for dark mode and Birdland Light for light mode, the same values the iOS
 //! app uses. The comments give each color's Base24 slot.
 

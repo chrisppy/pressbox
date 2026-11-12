@@ -115,7 +115,7 @@ _: {
 
             meta = {
               inherit description license mainProgram;
-              homepage = "https://github.com/chrisppy/pressbox";
+              homepage = "https://github.com/red-oxide/pressbox";
               platforms = lib.platforms.unix;
             };
           }
@@ -158,7 +158,7 @@ _: {
 
           meta = {
             description = "Desktop client for pressbox, built with iced";
-            homepage = "https://github.com/chrisppy/pressbox";
+            homepage = "https://github.com/red-oxide/pressbox";
             license = lib.licenses.gpl3Only;
             mainProgram = "pressbox-iced";
             platforms = lib.platforms.linux ++ lib.platforms.darwin;

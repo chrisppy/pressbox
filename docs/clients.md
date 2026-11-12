@@ -112,12 +112,12 @@ The player shows up in the system's media controls (MPRIS on Linux, Now Playing
 on macOS), so media keys, headphone buttons and Birdland's bar can play, pause
 and seek it; "next" and "previous" skip 30 seconds forward and 10 back.
 
-Colors are [Birdland](https://github.com/chrisppy/base24-themes), and Birdland
+Colors are [Birdland](https://github.com/red-oxide/base24-themes), and Birdland
 Light when the system is in light mode.
 
 ### In the Birdland bar
 
-[Birdland](https://github.com/chrisppy/birdland)'s bar, bullpen, has a `feeds`
+[Birdland](https://github.com/red-oxide/birdland)'s bar, bullpen, has a `feeds`
 module showing the unread count. Click opens `pressbox` in your terminal, right
 click asks the server to fetch every feed, and new items send a notification. It
 reads the same `client.json` and token as `pressbox`, so pairing the TUI is all
@@ -129,4 +129,4 @@ programs.birdland.bullpen.layout.right = [ "feeds" "clock" ]; # among your modul
 
 Its options (`programs.birdland.bullpen.feeds.command`, `interval` and
 `notifications`) are in
-[Birdland's configuration options](https://github.com/chrisppy/birdland/blob/master/docs/usage.md#configuration-options).
+[Birdland's configuration options](https://github.com/red-oxide/birdland/blob/master/docs/usage.md#configuration-options).

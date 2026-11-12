@@ -7,7 +7,7 @@ resolver = "3"
 
 [workspace.package]
 edition      = "2024"
-repository   = "https://github.com/chrisppy/pressbox"
+repository   = "https://github.com/red-oxide/pressbox"
 rust-version = "1.89"
 version      = "2026.11.0"
 

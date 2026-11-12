@@ -45,7 +45,7 @@ pub fn client() -> Result<reqwest::Client> {
         .user_agent(concat!(
             "pressbox/",
             env!("CARGO_PKG_VERSION"),
-            " (+https://github.com/chrisppy/pressbox)"
+            " (+https://github.com/red-oxide/pressbox)"
         ))
         .timeout(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(10))

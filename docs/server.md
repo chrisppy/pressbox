@@ -10,7 +10,7 @@ Add the flake to your system configuration:
 ```nix
 {
   inputs.pressbox = {
-    url = "github:chrisppy/pressbox";
+    url = "github:red-oxide/pressbox";
     inputs.nixpkgs.follows = "nixpkgs";
   };
 }

@@ -13,8 +13,8 @@ the release, then a count that starts at 0 each month (2026.11.0, 2026.11.1,
 server, `pressboxctl` and the clients in this repository share one version; the
 HTTP API has its own (the `v1` in `/api/v1`), which only changes on an
 incompatible change. The Apple and Android apps,
-[pressbox-darwin](https://github.com/chrisppy/pressbox-darwin) and
-[pressbox-android](https://github.com/chrisppy/pressbox-android), have their own
+[pressbox-darwin](https://github.com/red-oxide/pressbox-darwin) and
+[pressbox-android](https://github.com/red-oxide/pressbox-android), have their own
 releases.
 
 ## [2026.11.0] - Unreleased
@@ -132,5 +132,5 @@ The first release.
 - Checks: NixOS and Home Manager module tests, a NixOS VM test, treefmt and
   reuse lint; `cargo deny` in CI.
 
-[0.1.0]: https://github.com/chrisppy/pressbox/releases/tag/v0.1.0
-[2026.11.0]: https://github.com/chrisppy/pressbox/compare/v0.1.0...v2026.11.0
+[0.1.0]: https://github.com/red-oxide/pressbox/releases/tag/v0.1.0
+[2026.11.0]: https://github.com/red-oxide/pressbox/compare/v0.1.0...v2026.11.0
