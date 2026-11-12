@@ -12,9 +12,11 @@ use ratatui::{
     widgets::{Block, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use crate::app::{ALL_ROW, App, FIXED_ROWS, Pane, STARRED_ROW};
+use crate::app::{ALL_ROW, App, FIXED_ROWS, Pane, STARRED_ROW, UP_NEXT_ROW};
 
-const HELP: &str = "j/k move  enter open  / search  m read  M read below  s star  o browser  p play  A all read  u unread/all/read  r reload  R refresh  q quit";
+const HELP: &str = "j/k move  enter open  / search  m read  M read below  s star  o browser  p play  a up next  A all read  u unread/all/read  r reload  R refresh  q quit";
+const UP_NEXT_HELP: &str =
+    "j/k move  J/K reorder  a remove  n play next  p play  enter open  h back  q quit";
 const PLAYER_HELP: &str = "p pause  ,/. seek  [/] chapter  +/- speed  x stop";
 
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -46,6 +48,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Span::raw("█").cyan(),
             Span::raw("   enter search  esc cancel").dark_gray(),
         ])
+    } else if app.status.is_empty() && app.showing_queue() && app.focus == Pane::Items {
+        Line::from(UP_NEXT_HELP).dark_gray()
     } else if app.status.is_empty() {
         Line::from(HELP).dark_gray()
     } else if app.status.starts_with("error") {
@@ -80,6 +84,10 @@ fn draw_feeds(frame: &mut Frame, app: &App, area: Rect) {
         ListItem::new(format!("All items ({})", app.total_unread())).bold(),
     );
     rows.insert(STARRED_ROW, ListItem::new("★ Starred").bold());
+    rows.insert(
+        UP_NEXT_ROW,
+        ListItem::new(format!("≡ Up Next ({})", app.queue.len())).bold(),
+    );
     for feed in &app.feeds {
         let title = Span::raw(feed.title.clone());
         let mut spans = vec![if feed.archived {
@@ -192,6 +200,8 @@ fn draw_items(frame: &mut Frame, app: &App, area: Rect) {
     let more = if app.next_page.is_some() { "+" } else { "" };
     let title = if let Some(q) = &app.search {
         format!(" Search {q:?}: {}{more} (esc clears) ", app.items.len())
+    } else if app.showing_queue() {
+        format!(" Up Next: {} ", app.items.len())
     } else {
         let what = if app.filters_by_read() {
             app.show.label()
@@ -242,6 +252,11 @@ fn draw_reader(frame: &mut Frame, app: &App, area: Rect) {
                 "  t transcript"
             });
         }
+        keys.push_str(if app.is_queued(item.id) {
+            "  a remove from up next  n play next"
+        } else {
+            "  a up next  n play next"
+        });
         lines.push(Line::from(keys).dark_gray());
     }
     lines.push(Line::default());
@@ -413,6 +428,7 @@ mod tests {
             " Feeds ",
             "All items (2)",
             "★ Starred",
+            "≡ Up Next (0)",
             "Feed a (2) !",
             "Feed old (removed)",
             " Items: 2 unread ",
@@ -606,6 +622,27 @@ mod tests {
     }
 
     #[test]
+    fn up_next_has_its_own_title_and_keys() {
+        let mut app = app();
+        app.queue = vec![episode(1)];
+        app.items = vec![episode(1)];
+        app.feed_row = crate::app::UP_NEXT_ROW;
+        app.focus = Pane::Items;
+        let rows = screen(&app, 160, 12);
+        for text in ["≡ Up Next (1)", " Up Next: 1 ", "J/K reorder  a remove"] {
+            assert!(
+                contains(&rows, text),
+                "{text:?} missing:\n{}",
+                rows.join("\n")
+            );
+        }
+        app.reader = Some(Reader::new(episode(1)));
+        app.focus = Pane::Reader;
+        let rows = screen(&app, 160, 30);
+        assert!(contains(&rows, "a remove from up next  n play next"));
+    }
+
+    #[test]
     fn the_reader_shows_episodes() {
         let mut app = app();
         let mut reader = Reader::new(episode(1));
@@ -616,7 +653,7 @@ mod tests {
         let rows = screen(&app, 100, 30);
         for text in [
             "▶ video · 1:02:03 · S2E10 · 1:05 played",
-            "p play  V video  t transcript",
+            "p play  V video  t transcript  a up next  n play next",
             "Chapters",
             "    0:00  Intro",
             "    1:00  News",

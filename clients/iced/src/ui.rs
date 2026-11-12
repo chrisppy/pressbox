@@ -12,7 +12,7 @@ use iced::{
 use pressbox_api::{Chapter, Item, Media, Transcript};
 
 use crate::{
-    app::{App, Flag, Message, Playback, Reader, Screen, Setup, Source},
+    app::{App, Flag, Message, Playback, QueueChange, Reader, Screen, Setup, Source},
     controls,
     theme::Colors,
 };
@@ -121,6 +121,11 @@ fn sidebar(reader: &Reader) -> Element<'_, Message> {
         source_button("Starred", None, Source::Starred, reader),
     ]
     .spacing(2);
+    // Servers without a queue: no Up Next.
+    if let Some(queue) = &reader.queue {
+        let n = u32::try_from(queue.len()).unwrap_or(u32::MAX);
+        list = list.push(source_button("Up Next", Some(n), Source::UpNext, reader));
+    }
 
     let tags = reader.tags();
     if !tags.is_empty() {
@@ -250,7 +255,10 @@ fn item_list(reader: &Reader) -> Element<'_, Message> {
             text(reader.source_title()).size(18).width(Fill),
             button(text("Mark all read").size(13))
                 .style(button::text)
-                .on_press_maybe((reader.source != Source::Starred).then_some(Message::MarkAllRead)),
+                .on_press_maybe(
+                    (!matches!(reader.source, Source::Starred | Source::UpNext))
+                        .then_some(Message::MarkAllRead)
+                ),
         ]
         .align_y(Alignment::Center),
         text_input("Search", &reader.search)
@@ -494,6 +502,44 @@ fn episode<'a>(item: &'a Item, media: &'a Media, reader: &'a Reader) -> Element<
                 .style(button::secondary)
                 .on_press(Message::ToggleTranscript),
         );
+    }
+    if reader.queue.is_some() {
+        let queued = reader.is_queued(item.id);
+        let label = if queued {
+            "Remove from Up Next"
+        } else {
+            "Add to Up Next"
+        };
+        buttons = buttons.push(
+            button(text(label).size(13))
+                .style(button::secondary)
+                .on_press(Message::Queue(QueueChange::Toggle)),
+        );
+        let first = reader
+            .queue
+            .iter()
+            .flatten()
+            .next()
+            .is_some_and(|i| i.id == item.id);
+        if !first {
+            buttons = buttons.push(
+                button(text("Play next").size(13))
+                    .style(button::secondary)
+                    .on_press(Message::Queue(QueueChange::PlayNext)),
+            );
+        }
+        if queued && reader.showing_queue() {
+            buttons = buttons.push(
+                button(text("↑").size(13))
+                    .style(button::secondary)
+                    .on_press(Message::Queue(QueueChange::Move(-1))),
+            );
+            buttons = buttons.push(
+                button(text("↓").size(13))
+                    .style(button::secondary)
+                    .on_press(Message::Queue(QueueChange::Move(1))),
+            );
+        }
     }
     let mut part = column![buttons].spacing(6);
     if !facts.is_empty() {
@@ -1003,6 +1049,49 @@ mod tests {
         let mut p = Playback::new(item, chapters(), state, video);
         p.player = loaded.then(|| crate::player::tests::Fake::default().boxed());
         p
+    }
+
+    #[test]
+    fn up_next_shows_in_the_sidebar_and_on_episodes() {
+        let mut reader = reader();
+        assert!(
+            simulator(sidebar(&reader)).find("Up Next").is_err(),
+            "no queue"
+        );
+        reader.queue = Some(vec![episode_item(3), episode_item(1)]);
+        let mut ui = simulator(sidebar(&reader));
+        ui.click("Up Next").unwrap();
+        assert!(matches!(
+            &ui.into_messages().collect::<Vec<_>>()[..],
+            [Message::Select(Source::UpNext)]
+        ));
+
+        // Queued second, listed in Up Next: it can move and play next.
+        reader.source = Source::UpNext;
+        reader.article = Some(episode_item(1));
+        reader.selected = Some(1);
+        let mut ui = simulator(article(&reader));
+        for label in ["Remove from Up Next", "Play next", "↑", "↓"] {
+            ui.click(label).unwrap();
+        }
+        assert!(matches!(
+            &ui.into_messages().collect::<Vec<_>>()[..],
+            [
+                Message::Queue(QueueChange::Toggle),
+                Message::Queue(QueueChange::PlayNext),
+                Message::Queue(QueueChange::Move(-1)),
+                Message::Queue(QueueChange::Move(1)),
+            ]
+        ));
+
+        // Not queued, elsewhere: added, or put first.
+        reader.source = Source::All;
+        reader.queue = Some(vec![episode_item(3)]);
+        let mut ui = simulator(article(&reader));
+        assert!(ui.find("↑").is_err());
+        ui.click("Add to Up Next").unwrap();
+        ui.click("Play next").unwrap();
+        assert_eq!(ui.into_messages().count(), 2);
     }
 
     #[test]

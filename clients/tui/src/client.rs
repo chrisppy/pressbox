@@ -8,7 +8,8 @@ use std::{path::PathBuf, time::Duration};
 use anyhow::{Context, Result, bail};
 use pressbox_api::{
     ApproveRequest, Approved, Chapters, Feed, Flag, Item, ItemPage, ItemQuery, MarkRead, Me,
-    PairApproved, PairRequest, PairStart, PendingPairing, Position, Transcript, Updated, Version,
+    PairApproved, PairRequest, PairStart, PendingPairing, Position, Queue, QueueOrder, Transcript,
+    Updated, Version,
 };
 use serde::Deserialize;
 
@@ -144,6 +145,28 @@ impl Client {
             return Ok(None);
         }
         Ok(Some(Self::send_checked(resp)?.json()?))
+    }
+
+    /// The Up Next queue, in order.
+    pub fn queue(&self) -> Result<Vec<Item>> {
+        let resp = self.request(reqwest::Method::GET, "/api/v1/queue").send()?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("the server has no Up Next queue; upgrade pressboxd");
+        }
+        Ok(Self::send_checked(resp)?.json::<Queue>()?.items)
+    }
+
+    /// Replaces the Up Next queue with `ids`, in order; returns what the
+    /// server kept.
+    pub fn set_queue(&self, ids: &[i64]) -> Result<Vec<Item>> {
+        let resp = self
+            .request(reqwest::Method::PUT, "/api/v1/queue")
+            .json(&QueueOrder { ids: ids.to_vec() })
+            .send()?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            bail!("the server has no Up Next queue; upgrade pressboxd");
+        }
+        Ok(Self::send_checked(resp)?.json::<Queue>()?.items)
     }
 
     pub fn mark_feed_read(&self, feed: &str) -> Result<u32> {
@@ -389,6 +412,33 @@ mod tests {
                 "get /api/v1/items/7/transcript http/1.1",
                 "get /api/v1/items/8/transcript http/1.1",
                 "get /api/v1/items/9/transcript http/1.1",
+            ]
+        );
+    }
+
+    #[test]
+    fn queue_routes() {
+        let one = r#"{"items":[{"id":7,"feed_id":"a","title":"Seven","url":null,"author":null,
+            "summary":null,"published":0,"read":false,"starred":false}]}"#;
+        let (base, requests) = server(vec![(200, one), (200, one), (404, "{}"), (404, "{}")]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        assert_eq!(client.queue().unwrap()[0].id, 7);
+        assert_eq!(client.set_queue(&[7, 8]).unwrap().len(), 1);
+        // An older server.
+        assert!(format!("{:#}", client.queue().unwrap_err()).contains("upgrade pressboxd"));
+        assert!(format!("{:#}", client.set_queue(&[7]).unwrap_err()).contains("upgrade pressboxd"));
+        let lines: Vec<String> = requests
+            .iter()
+            .take(4)
+            .map(|h| h.lines().next().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "get /api/v1/queue http/1.1",
+                "put /api/v1/queue http/1.1",
+                "get /api/v1/queue http/1.1",
+                "put /api/v1/queue http/1.1",
             ]
         );
     }

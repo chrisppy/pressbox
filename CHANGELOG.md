@@ -72,6 +72,9 @@ own releases.
 
 ### Desktop client
 
+- Up Next: the server's queue in the sidebar, Add to Up Next and Play next on
+  episodes (`a`, `n`), ↑ and ↓ (`J`, `K`) to reorder, and the next episode
+  starts when one ends.
 - Plays podcasts with GStreamer: audio in the background, video above the
   article, with a player bar (progress, chapters, skip, speed without pitch
   change), clickable chapters and a transcript that follows playback. Positions
@@ -90,6 +93,9 @@ own releases.
 
 ### Terminal client
 
+- Up Next, a row under Starred that lists the server's queue: `a` adds an episode
+  or takes it out, `n` plays it next, `J`/`K` reorder, and the next episode
+  starts when one ends.
 - Plays podcasts in mpv: `p` plays or pauses, `V` plays the video, `x` stops,
   `,`/`.` seek, `[`/`]` move between chapters and `-`/`+` change the speed. The
   position syncs with the server, so playback resumes on any client, and an

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use pressbox_api::{
     ApproveRequest, Approved, Chapters, Feed, Flag, Item, ItemPage, ItemQuery, Me, PairApproved,
-    PairRequest, PairStart, Position, Transcript, Updated, Version,
+    PairRequest, PairStart, Position, Queue, QueueOrder, Transcript, Updated, Version,
 };
 use reqwest::{Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
@@ -125,6 +125,22 @@ impl Client {
     /// An item's transcript; `None` if it has none.
     pub async fn transcript(self, id: i64) -> Result<Option<Transcript>> {
         Self::optional(self.request(Method::GET, &format!("/api/v1/items/{id}/transcript"))).await
+    }
+
+    /// The Up Next queue, in order; `None` from a server without one.
+    pub async fn queue(self) -> Result<Option<Vec<Item>>> {
+        let queue: Option<Queue> =
+            Self::optional(self.request(Method::GET, "/api/v1/queue")).await?;
+        Ok(queue.map(|q| q.items))
+    }
+
+    /// Replaces the Up Next queue with `ids`, in order; returns what the
+    /// server kept.
+    pub async fn set_queue(self, ids: Vec<i64>) -> Result<Vec<Item>> {
+        let req = self
+            .request(Method::PUT, "/api/v1/queue")
+            .json(&QueueOrder { ids });
+        Ok(Self::json::<Queue>(req).await?.items)
     }
 
     /// JSON, or `None` for a 404.
@@ -289,6 +305,25 @@ mod tests {
         assert_eq!(
             offline.transcript(1).await.unwrap_err(),
             "could not connect to the server"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_routes() {
+        let one = r#"{"items":[{"id":7,"feed_id":"a","title":"Seven","url":null,"author":null,
+            "summary":null,"published":0,"read":false,"starred":false}]}"#;
+        let (base, requests) = server(vec![(200, one), (200, one), (404, "{}")]);
+        let client = Client::new(&base, Some("tok".into())).unwrap();
+        assert_eq!(client.clone().queue().await.unwrap().unwrap()[0].id, 7);
+        assert_eq!(client.clone().set_queue(vec![7, 8]).await.unwrap().len(), 1);
+        assert_eq!(client.queue().await.unwrap(), None, "an older server");
+        assert_eq!(
+            lines(&requests, 3),
+            [
+                "get /api/v1/queue",
+                "put /api/v1/queue",
+                "get /api/v1/queue"
+            ]
         );
     }
 

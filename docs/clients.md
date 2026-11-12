@@ -52,6 +52,9 @@ requests, and `pressbox whoami` shows the signed-in user and device.
 | `[` / `]` | Previous / next chapter |
 | `-` / `+` | Slower / faster |
 | `t` | Show the episode's transcript (in the reader) |
+| `a` | Add the episode to Up Next, or take it out |
+| `n` | Play the episode next (first in Up Next) |
+| `J` / `K` | Move the episode down / up (in Up Next) |
 | `q` | Quit |
 
 Podcast episodes (items with audio or video) are marked `♪` in the list, `◐`
@@ -65,11 +68,16 @@ the end (or stopped in its last 30 seconds) is marked read. Opening an episode
 doesn't mark it read. The reader lists its chapters, the current one highlighted
 while it plays, and `t` swaps the text for the transcript.
 
+Up Next, under Starred in the feed list, is the queue of episodes to play next,
+kept on the server so every client shares it. When an episode plays to the end,
+the first one in Up Next starts, and finished episodes leave it. It needs a
+pressboxd with a queue; with an older one it stays empty.
+
 ### pressbox-iced (desktop client)
 
-A window with three panes: sources (Unread, All items, Starred, tags and feeds,
-with unread counts), the item list with search, and the article. Opening an item
-marks it read. Its desktop entry is named "pressbox", and its Wayland app ID is
+A window with three panes: sources (Unread, All items, Starred, Up Next, tags
+and feeds, with unread counts), the item list with search, and the article.
+Opening an item marks it read. Its desktop entry is named "pressbox", and its Wayland app ID is
 `pressbox-iced`, for window rules.
 
 On a machine that isn't paired yet it asks for the server and a device name and
@@ -92,6 +100,9 @@ token.
 | `,` / `.` | Back 10s / forward 30s |
 | `[` / `]` | Previous / next chapter |
 | `t` | Show the transcript |
+| `a` | Add the episode to Up Next, or take it out |
+| `n` | Play the episode next (first in Up Next) |
+| `J` / `K` | Move the episode later / earlier in Up Next |
 | `Esc` | Dismiss a message |
 
 Podcast episodes are marked `♪` in the list (`◐` once started, `▶` while
@@ -107,6 +118,12 @@ The position is saved on the server every 15 seconds and on pause and stop, so
 playback resumes where you left off on any client, and an episode played to the
 end (or stopped in its last 30 seconds) is marked read. Opening an episode
 doesn't mark it read.
+
+Up Next, in the sidebar when the server has a queue, lists the episodes to play
+next; an episode's article has Add to Up Next (or Remove) and Play next
+buttons, and, in Up Next, ↑ and ↓ to reorder. When an episode plays to the end,
+the first one in Up Next starts. The queue is kept on the server, so it is the
+same in every client.
 
 The player shows up in the system's media controls (MPRIS on Linux, Now Playing
 on macOS), so media keys, headphone buttons and Birdland's bar can play, pause

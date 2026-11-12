@@ -57,8 +57,21 @@ pub enum Source {
     Unread,
     All,
     Starred,
+    /// The Up Next queue, in playing order.
+    UpNext,
     Feed(String),
     Tag(String),
+}
+
+/// A change to Up Next, about the open article's episode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueChange {
+    /// Adds it at the end, or takes it out if queued.
+    Toggle,
+    /// Puts it first.
+    PlayNext,
+    /// Moves it one place later (`1`) or earlier (`-1`).
+    Move(isize),
 }
 
 pub struct Reader {
@@ -89,6 +102,8 @@ pub struct Reader {
     pub transcript: Option<Option<Transcript>>,
     /// Showing the transcript instead of the article's text.
     pub show_transcript: bool,
+    /// The Up Next queue; `None` until loaded, or from a server without one.
+    pub queue: Option<Vec<Item>>,
     pub playback: Option<Playback>,
     /// Bumped for each episode loaded, so a late load of an episode since
     /// replaced (or stopped) is dropped.
@@ -207,6 +222,10 @@ pub enum Message {
     TranscriptLoaded(i64, api::Result<Option<Transcript>>),
     PositionSaved(api::Result<()>),
     MediaKey(MediaKey),
+    QueueLoaded(api::Result<Option<Vec<Item>>>),
+    Queue(QueueChange),
+    /// What the server kept of a new queue.
+    QueueSet(api::Result<Vec<Item>>),
 
     ThemeMode(iced::theme::Mode),
 }
@@ -262,7 +281,7 @@ impl App {
         );
         let items = reader.reload();
         self.screen = Screen::Reader(Box::new(reader));
-        Task::batch([identity, load_feeds(&client), items])
+        Task::batch([identity, load_feeds(&client), load_queue(&client), items])
     }
 
     pub fn title(&self) -> String {
@@ -417,6 +436,7 @@ impl Reader {
             chapters: Vec::new(),
             transcript: None,
             show_transcript: false,
+            queue: None,
             playback: None,
             playback_generation: 0,
             load_player: player::load,
@@ -434,6 +454,7 @@ impl Reader {
             Source::Unread => query.unread = Some(true),
             Source::All => {}
             Source::Starred => query.starred = Some(true),
+            Source::UpNext => {}
             Source::Feed(f) => query.feed = Some(f.clone()),
             Source::Tag(t) => query.tag = Some(t.clone()),
         }
@@ -450,6 +471,19 @@ impl Reader {
         self.loading = true;
         self.next_cursor = None;
         let generation = self.generation;
+        if self.showing_queue() {
+            let queue = self.client.clone().queue();
+            return Task::perform(
+                async move {
+                    Ok(ItemPage {
+                        items: queue.await?.unwrap_or_default(),
+                        next_cursor: None,
+                        next_offset: None,
+                    })
+                },
+                move |r| Message::ItemsLoaded(generation, false, r),
+            );
+        }
         Task::perform(self.client.clone().items(self.query()), move |r| {
             Message::ItemsLoaded(generation, false, r)
         })
@@ -481,6 +515,7 @@ impl Reader {
             Source::Unread => "Unread".into(),
             Source::All => "All items".into(),
             Source::Starred => "Starred".into(),
+            Source::UpNext => "Up Next".into(),
             Source::Feed(f) => self.feed_title(f),
             Source::Tag(t) => format!("#{t}"),
         }
@@ -508,6 +543,15 @@ impl Reader {
                 *slot = value;
                 changed = true;
                 feed_id = Some(item.feed_id.clone());
+            }
+        }
+        // As on the server: read items leave Up Next.
+        if flag == Flag::Read && value {
+            if let Some(queue) = self.queue.as_mut() {
+                queue.retain(|i| i.id != id);
+            }
+            if self.showing_queue() {
+                self.items.retain(|i| i.id != id);
             }
         }
         if changed
@@ -551,9 +595,7 @@ impl Reader {
         self.show_transcript = false;
         let media = self.article.as_ref().and_then(|i| i.media.as_ref());
         let chapters = if media.is_some_and(|m| m.chapters.is_some()) {
-            Task::perform(self.client.clone().chapters(id), move |r| {
-                Message::ChaptersLoaded(id, r)
-            })
+            load_chapters(&self.client, id)
         } else {
             Task::none()
         };
@@ -572,6 +614,7 @@ impl Reader {
             .items
             .iter_mut()
             .chain(self.article.iter_mut())
+            .chain(self.queue.iter_mut().flatten())
             .filter(|i| i.id == id)
         {
             item.position = position;
@@ -601,6 +644,12 @@ impl Reader {
         let Some(item) = article else {
             return Task::none();
         };
+        self.start(item, video)
+    }
+
+    /// Starts an episode (its video, with `video`), resuming where it was
+    /// left, after stopping whatever plays.
+    fn start(&mut self, item: Item, video: bool) -> Task<Message> {
         let media = item.media.clone().unwrap_or_default();
         let enclosure = if video {
             media.video()
@@ -617,6 +666,7 @@ impl Reader {
             .items
             .iter()
             .chain(self.article.iter())
+            .chain(self.queue.iter().flatten())
             .find(|i| i.id == item.id)
             .map_or(item.position, |i| i.position);
         // Played to the end before: start again.
@@ -624,8 +674,19 @@ impl Reader {
             Some(d) if f64::from(position) >= f64::from(d) - NEAR_END => 0,
             _ => position,
         };
-        // The episode is the open article's.
-        let chapters = self.chapters.clone();
+        // The open article's chapters are loaded already; another
+        // episode's (from Up Next) are fetched.
+        let open = self.selected == Some(item.id);
+        let fetch_chapters = if !open && media.chapters.is_some() {
+            load_chapters(&self.client, item.id)
+        } else {
+            Task::none()
+        };
+        let chapters = if open {
+            self.chapters.clone()
+        } else {
+            Vec::new()
+        };
         if self.remote.is_none() {
             self.remote = (self.start_remote)();
         }
@@ -663,7 +724,7 @@ impl Reader {
             },
             move |r| Message::PlayerLoaded(generation, r),
         );
-        Task::batch([stopped, loading])
+        Task::batch([stopped, loading, fetch_chapters])
     }
 
     /// Stops playing. Played to (near) the end, the episode is marked read
@@ -696,14 +757,83 @@ impl Reader {
                 .find(|i| i.id == id)
                 .map_or(playback.item.read, |i| i.read);
             let saved = self.save_position(id, 0);
-            if read {
-                saved
-            } else {
+            if !read {
                 Task::batch([saved, self.set_flag(id, Flag::Read, true)])
+            } else if self.is_queued(id) {
+                // Played again: marking it read, which takes it out of Up
+                // Next, changed nothing.
+                let ids = self.queue_ids().into_iter().filter(|&q| q != id).collect();
+                Task::batch([saved, self.set_queue(ids)])
+            } else {
+                saved
             }
         } else {
             self.save_position(id, playback.position())
         }
+    }
+
+    /// The item list is Up Next (not a search from it).
+    pub fn showing_queue(&self) -> bool {
+        self.source == Source::UpNext && self.search.trim().is_empty()
+    }
+
+    pub fn is_queued(&self, id: i64) -> bool {
+        self.queue.iter().flatten().any(|i| i.id == id)
+    }
+
+    fn queue_ids(&self) -> Vec<i64> {
+        self.queue.iter().flatten().map(|i| i.id).collect()
+    }
+
+    /// Replaces Up Next: reordered here at once, then as the server keeps
+    /// it.
+    fn set_queue(&mut self, ids: Vec<i64>) -> Task<Message> {
+        if let Some(mut known) = self.queue.take() {
+            known.extend(self.article.clone());
+            let queue: Vec<Item> = ids
+                .iter()
+                .filter_map(|id| known.iter().find(|i| i.id == *id).cloned())
+                .collect();
+            if self.showing_queue() {
+                self.items.clone_from(&queue);
+            }
+            self.queue = Some(queue);
+        }
+        Task::perform(self.client.clone().set_queue(ids), Message::QueueSet)
+    }
+
+    /// `Queue`: changes Up Next for the open article's episode.
+    fn change_queue(&mut self, change: QueueChange) -> Task<Message> {
+        let Some(id) = self
+            .article
+            .as_ref()
+            .filter(|i| i.media.is_some())
+            .map(|i| i.id)
+        else {
+            return Task::none();
+        };
+        if self.queue.is_none() {
+            self.error = Some("This server has no Up Next; upgrade pressboxd.".into());
+            return Task::none();
+        }
+        let mut ids = self.queue_ids();
+        let at = ids.iter().position(|&q| q == id);
+        match (change, at) {
+            (QueueChange::Toggle, Some(at)) => {
+                ids.remove(at);
+            }
+            (QueueChange::Toggle, None) => ids.push(id),
+            (QueueChange::PlayNext, _) => {
+                ids.retain(|&q| q != id);
+                ids.insert(0, id);
+            }
+            (QueueChange::Move(by), Some(at)) => match at.checked_add_signed(by) {
+                Some(to) if to < ids.len() => ids.swap(at, to),
+                _ => return Task::none(),
+            },
+            (QueueChange::Move(_), None) => return Task::none(),
+        }
+        self.set_queue(ids)
     }
 
     /// `PlayerTick`: follows the player, saves the position now and then,
@@ -735,7 +865,12 @@ impl Reader {
             }
             Some(state) => {
                 playback.state = state;
-                self.stop()
+                let stopped = self.stop();
+                // Up Next: carry on with the next episode.
+                match self.queue.iter().flatten().next().cloned() {
+                    Some(next) => Task::batch([stopped, self.start(next, false)]),
+                    None => stopped,
+                }
             }
             None => {
                 self.error = Some("Playback stopped: the episode couldn't be played.".into());
@@ -879,6 +1014,27 @@ impl Reader {
             | Message::PositionSaved(Err(e)) => {
                 self.error = Some(e);
                 Task::none()
+            }
+            Message::QueueLoaded(Ok(queue)) => {
+                self.queue = queue;
+                Task::none()
+            }
+            Message::Queue(change) => self.change_queue(change),
+            Message::QueueSet(Ok(items)) => {
+                if self.showing_queue() {
+                    self.items.clone_from(&items);
+                }
+                self.queue = Some(items);
+                Task::none()
+            }
+            Message::QueueLoaded(Err(e)) => {
+                self.error = Some(e);
+                Task::none()
+            }
+            Message::QueueSet(Err(e)) => {
+                self.error = Some(e);
+                // Back to what the server has.
+                load_queue(&self.client)
             }
             Message::MediaKey(key) => {
                 let paused = self.playback.as_ref().map(|p| p.state.paused);
@@ -1033,7 +1189,7 @@ impl Reader {
                         .filter(|f| f.unread > 0)
                         .map(|f| f.id.clone())
                         .collect(),
-                    Source::Starred => Vec::new(),
+                    Source::Starred | Source::UpNext => Vec::new(),
                 };
                 if feeds.is_empty() {
                     return Task::none();
@@ -1055,7 +1211,11 @@ impl Reader {
                     "Marked {n} item{} as read",
                     if n == 1 { "" } else { "s" }
                 ));
-                Task::batch([load_feeds(&self.client), self.reload()])
+                Task::batch([
+                    load_feeds(&self.client),
+                    load_queue(&self.client),
+                    self.reload(),
+                ])
             }
             Message::Refresh => {
                 self.status = Some("Refreshing feeds…".into());
@@ -1063,7 +1223,11 @@ impl Reader {
             }
             Message::Refreshed(Ok(())) => {
                 self.status = None;
-                Task::batch([load_feeds(&self.client), self.reload()])
+                Task::batch([
+                    load_feeds(&self.client),
+                    load_queue(&self.client),
+                    self.reload(),
+                ])
             }
             Message::ApproveCodeChanged(s) => {
                 self.approve_code = s.to_uppercase();
@@ -1104,6 +1268,16 @@ fn load_feeds(client: &Client) -> Task<Message> {
     Task::perform(client.clone().feeds(), Message::FeedsLoaded)
 }
 
+fn load_chapters(client: &Client, id: i64) -> Task<Message> {
+    Task::perform(client.clone().chapters(id), move |r| {
+        Message::ChaptersLoaded(id, r)
+    })
+}
+
+fn load_queue(client: &Client) -> Task<Message> {
+    Task::perform(client.clone().queue(), Message::QueueLoaded)
+}
+
 fn on_key(event: keyboard::Event) -> Option<Message> {
     use keyboard::{Key, key::Named};
     let keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
@@ -1126,6 +1300,10 @@ fn on_key(event: keyboard::Event) -> Option<Message> {
         Key::Character("[") => Some(Message::Chapter(false)),
         Key::Character("]") => Some(Message::Chapter(true)),
         Key::Character("t") => Some(Message::ToggleTranscript),
+        Key::Character("a") => Some(Message::Queue(QueueChange::Toggle)),
+        Key::Character("n") => Some(Message::Queue(QueueChange::PlayNext)),
+        Key::Character("J") => Some(Message::Queue(QueueChange::Move(1))),
+        Key::Character("K") => Some(Message::Queue(QueueChange::Move(-1))),
         Key::Named(Named::Escape) => Some(Message::Dismiss),
         _ => None,
     }
@@ -1563,6 +1741,7 @@ mod tests {
             ),
             ("GET /api/v1/version", 200, r#"{"version":"0.1.0","api":1}"#),
             ("GET /api/v1/feeds", 200, FEEDS),
+            ("GET /api/v1/queue", 200, r#"{"items":[]}"#),
             ("GET /api/v1/items/7", 200, ITEM),
             ("GET /api/v1/items", 200, ONE_PAGE),
             ("PUT /api/v1/items/7/", 204, ""),
@@ -1615,26 +1794,25 @@ mod tests {
         .unwrap();
 
         let (mut app, task) = App::boot_from(Some(path.clone()));
-        let messages = run(task, 3).await;
-        assert!(
-            matches!(
-                &messages[..],
-                [
-                    Message::Identity(Ok(_)),
-                    Message::FeedsLoaded(Ok(_)),
-                    Message::ItemsLoaded(..)
-                ] | [
-                    Message::Identity(Ok(_)),
-                    Message::ItemsLoaded(..),
-                    Message::FeedsLoaded(Ok(_))
-                ] | [Message::FeedsLoaded(Ok(_)), ..]
-                    | [Message::ItemsLoaded(..), ..]
-            ),
-            "{messages:?}"
-        );
+        // Identity, feeds, Up Next and items, in whatever order they come.
+        let messages = run(task, 4).await;
+        for wanted in [
+            "Identity(Ok",
+            "FeedsLoaded(Ok",
+            "QueueLoaded(Ok",
+            "ItemsLoaded(",
+        ] {
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| format!("{m:?}").starts_with(wanted)),
+                "{wanted} missing: {messages:?}"
+            );
+        }
         let _ = answer(&mut app, messages);
         let reader = reading(&app);
         assert_eq!(reader.me.as_ref().map(|m| m.user.as_str()), Some("chris"));
+        assert_eq!(reader.queue, Some(vec![]), "the server has Up Next");
         assert_eq!((reader.feeds.len(), reader.items.len()), (2, 1));
         assert_eq!(app.title(), "pressbox (3)");
         let _ = app.subscription();
@@ -1744,7 +1922,21 @@ mod tests {
         assert!(matches!(&approved[..], [Message::Approved(Ok(a))] if a.name == "phone"));
         let refreshed = run(r.update(Message::Refresh), 1).await;
         assert!(matches!(refreshed[..], [Message::Refreshed(Ok(()))]));
-        assert_eq!(run(r.update(Message::Refreshed(Ok(()))), 2).await.len(), 2);
+        assert_eq!(run(r.update(Message::Refreshed(Ok(()))), 3).await.len(), 3);
+
+        // Up Next lists the server's queue; searching it searches everything.
+        let queued = run(r.update(Message::Select(Source::UpNext)), 1).await;
+        assert!(matches!(
+            queued[..],
+            [Message::ItemsLoaded(_, false, Ok(_))]
+        ));
+        assert_eq!(r.source_title(), "Up Next");
+        r.search = "seven".into();
+        let searched = run(r.reload(), 1).await;
+        assert!(matches!(
+            searched[..],
+            [Message::ItemsLoaded(_, false, Ok(_))]
+        ));
 
         let seen: Vec<String> = requests.try_iter().collect();
         for expected in [
@@ -1755,6 +1947,8 @@ mod tests {
             "POST /api/v1/feeds/b/read-all",
             "POST /api/v1/pairings/K7W-4QX/approve",
             "POST /api/v1/refresh",
+            "GET /api/v1/queue",
+            "GET /api/v1/items?q=seven&limit=50",
         ] {
             assert!(
                 seen.iter().any(|s| s.starts_with(expected)),
@@ -1962,6 +2156,87 @@ mod tests {
         r.selected = None;
         let _ = r.update(Message::ToggleTranscript);
         assert!(!r.show_transcript, "nothing open");
+    }
+
+    #[test]
+    fn up_next_queues_reorders_and_plays_on() {
+        let (mut r, fake) = podcast_reader();
+        let mut three = r.items[0].clone();
+        three.id = 3;
+        three.title = "Item 3".into();
+        three.position = 0;
+        r.items.push(three);
+        let ids = |r: &Reader| r.queue_ids();
+        let mut one = r.items[0].clone();
+
+        // A server without a queue says so.
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::Queue(QueueChange::Toggle));
+        assert!(r.error.take().unwrap().contains("no Up Next"));
+
+        r.queue = Some(Vec::new());
+        let _ = r.update(Message::Queue(QueueChange::Toggle));
+        let _ = r.update(Message::OpenItem(2));
+        let _ = r.update(Message::Queue(QueueChange::Toggle));
+        assert_eq!(ids(&r), [1], "only episodes");
+        let _ = r.update(Message::OpenItem(3));
+        let _ = r.update(Message::Queue(QueueChange::PlayNext));
+        assert_eq!(ids(&r), [3, 1]);
+
+        // Listed as Up Next, it reorders in place.
+        r.source = Source::UpNext;
+        r.items = r.queue.clone().unwrap();
+        let _ = r.update(Message::Queue(QueueChange::Move(1)));
+        assert_eq!(ids(&r), [1, 3]);
+        assert_eq!(r.items.iter().map(|i| i.id).collect::<Vec<_>>(), [1, 3]);
+        let _ = r.update(Message::Queue(QueueChange::Move(1)));
+        assert_eq!(ids(&r), [1, 3], "already last");
+        // What the server kept wins.
+        let kept = r.queue.clone().unwrap();
+        let _ = r.update(Message::QueueSet(Ok(kept)));
+        let _ = r.update(Message::QueueSet(Err("offline".into())));
+        assert_eq!(r.error.take().as_deref(), Some("offline"));
+
+        // Played to the end, an episode leaves Up Next and the next starts.
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::Play(false));
+        loaded(&mut r, &fake);
+        fake.at(1000.0, false, true);
+        let _ = r.update(Message::PlayerTick);
+        assert_eq!(ids(&r), [3]);
+        assert_eq!(r.items.iter().map(|i| i.id).collect::<Vec<_>>(), [3]);
+        let p = r.playback.as_ref().unwrap();
+        assert_eq!((p.item.id, p.state.position), (3, 0.0));
+
+        // Stopping doesn't go on.
+        loaded(&mut r, &fake);
+        let _ = r.update(Message::Stop);
+        assert!(r.playback.is_none());
+
+        // Back in a list with both: moving one that isn't queued does
+        // nothing; toggling takes it out.
+        r.source = Source::All;
+        one.read = true;
+        r.items = vec![one, r.items[0].clone()];
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::Queue(QueueChange::Move(1)));
+        assert_eq!(ids(&r), [3]);
+        let _ = r.update(Message::OpenItem(3));
+        let _ = r.update(Message::Queue(QueueChange::Toggle));
+        assert!(ids(&r).is_empty());
+
+        // Finished again when already read, it is taken out by hand.
+        let _ = r.update(Message::OpenItem(1));
+        let _ = r.update(Message::Queue(QueueChange::Toggle));
+        assert_eq!(ids(&r), [1]);
+        let _ = r.update(Message::Play(false));
+        loaded(&mut r, &fake);
+        fake.at(1000.0, false, true);
+        let _ = r.update(Message::PlayerTick);
+        assert!(ids(&r).is_empty() && r.playback.is_none());
+
+        let _ = r.update(Message::QueueLoaded(Err("offline".into())));
+        assert_eq!(r.error.as_deref(), Some("offline"));
     }
 
     #[test]

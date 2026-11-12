@@ -35,6 +35,8 @@ pub trait Backend {
     fn set_position(&self, id: i64, position: u32) -> Result<()>;
     fn chapters(&self, id: i64) -> Result<Chapters>;
     fn transcript(&self, id: i64) -> Result<Option<Transcript>>;
+    fn queue(&self) -> Result<Vec<Item>>;
+    fn set_queue(&self, ids: &[i64]) -> Result<Vec<Item>>;
 }
 
 impl Backend for Client {
@@ -71,6 +73,12 @@ impl Backend for Client {
     fn transcript(&self, id: i64) -> Result<Option<Transcript>> {
         Client::transcript(self, id)
     }
+    fn queue(&self) -> Result<Vec<Item>> {
+        Client::queue(self)
+    }
+    fn set_queue(&self, ids: &[i64]) -> Result<Vec<Item>> {
+        Client::set_queue(self, ids)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +91,9 @@ pub enum Pane {
 /// Rows above the real feeds in the feed list.
 pub const ALL_ROW: usize = 0;
 pub const STARRED_ROW: usize = 1;
-pub const FIXED_ROWS: usize = 2;
+/// The Up Next queue, which the item list shows in playing order.
+pub const UP_NEXT_ROW: usize = 2;
+pub const FIXED_ROWS: usize = 3;
 
 /// Which items the list shows, by read state. Starred lists and searches
 /// show both.
@@ -207,6 +217,8 @@ pub struct App {
     pub editing: Option<String>,
     pub player: Box<dyn Player>,
     pub playing: Option<Playing>,
+    /// The Up Next queue, as of the last reload or change.
+    pub queue: Vec<Item>,
 }
 
 /// Where the next page of items starts: a cursor, or an offset from a server
@@ -242,6 +254,7 @@ impl App {
             editing: None,
             player: Box::new(Mpv::new("mpv")),
             playing: None,
+            queue: Vec::new(),
         }
     }
 
@@ -262,9 +275,18 @@ impl App {
             .and_then(|i| self.feeds.get(i))
     }
 
-    /// Whether `show` applies: starred lists and searches ignore it.
+    /// Whether `show` applies: starred lists, Up Next and searches ignore it.
     pub fn filters_by_read(&self) -> bool {
-        self.feed_row != STARRED_ROW && self.search.is_none()
+        self.feed_row != STARRED_ROW && !self.showing_queue() && self.search.is_none()
+    }
+
+    /// The item list is Up Next (not a search from it).
+    pub fn showing_queue(&self) -> bool {
+        self.feed_row == UP_NEXT_ROW && self.search.is_none()
+    }
+
+    pub fn is_queued(&self, id: i64) -> bool {
+        self.queue.iter().any(|i| i.id == id)
     }
 
     fn query(&self, from: Option<&NextPage>) -> ItemQuery {
@@ -292,12 +314,21 @@ impl App {
         let result = (|| -> Result<()> {
             self.feeds = backend.feeds()?;
             self.feed_row = self.feed_row.min(self.feeds.len() + FIXED_ROWS - 1);
+            // Servers without a queue: Up Next stays empty.
+            self.queue = backend.queue().unwrap_or_default();
             self.load_items(backend)
         })();
         self.report(result);
     }
 
     fn load_items(&mut self, backend: &impl Backend) -> Result<()> {
+        if self.showing_queue() {
+            self.queue = backend.queue()?;
+            self.items = self.queue.clone();
+            self.next_page = None;
+            self.item_row = self.item_row.min(self.items.len().saturating_sub(1));
+            return Ok(());
+        }
         let page = backend.items(&self.query(None))?;
         self.next_page = NextPage::of(&page);
         self.items = page.items;
@@ -394,6 +425,10 @@ impl App {
                 KeyCode::Char('+') => self.speed(0.25)?,
                 KeyCode::Char('-') => self.speed(-0.25)?,
                 KeyCode::Char('t') => self.toggle_transcript(backend)?,
+                KeyCode::Char('a') => self.toggle_queued(backend)?,
+                KeyCode::Char('n') => self.play_next(backend)?,
+                KeyCode::Char('J') => self.move_queued(backend, 1)?,
+                KeyCode::Char('K') => self.move_queued(backend, -1)?,
                 KeyCode::Char('A') => self.mark_feed_read(backend)?,
                 KeyCode::Char('M') => self.mark_below_read(backend)?,
                 KeyCode::Char('u') => {
@@ -533,6 +568,12 @@ impl App {
             self.status = "nothing to play here".into();
             return Ok(());
         };
+        self.start(backend, item, video)
+    }
+
+    /// Starts an episode (its video, with `video`), resuming where it was
+    /// left, after stopping whatever plays.
+    fn start(&mut self, backend: &impl Backend, item: Item, video: bool) -> Result<()> {
         let media = item.media.clone().unwrap_or_default();
         let enclosure = if video {
             media.video()
@@ -606,7 +647,14 @@ impl App {
                 if let Some(state) = state {
                     playing.state = state;
                 }
-                self.stop(backend)
+                let ended = state.is_some_and(|s| s.ended);
+                self.stop(backend).and_then(|()| {
+                    // Up Next: carry on with the next episode.
+                    match self.queue.first().cloned() {
+                        Some(next) if ended => self.start(backend, next, false),
+                        _ => Ok(()),
+                    }
+                })
             }
         };
         self.report(result);
@@ -638,6 +686,16 @@ impl App {
                 .map_or(item.read, |i| i.read);
             if !read {
                 self.set_read(backend, item.id, &item.feed_id, true)?;
+            } else if self.is_queued(item.id) {
+                // Played again: marking it read, which takes it out of Up
+                // Next, changed nothing.
+                let ids: Vec<i64> = self
+                    .queue
+                    .iter()
+                    .map(|i| i.id)
+                    .filter(|&id| id != item.id)
+                    .collect();
+                self.set_queue(backend, &ids)?;
             }
             self.status = format!("finished {}", item.title);
         } else {
@@ -740,6 +798,14 @@ impl App {
     ) -> Result<()> {
         backend.set_read(id, read)?;
         self.update_item(id, |i| i.read = read);
+        // As on the server: read items leave Up Next.
+        if read {
+            self.queue.retain(|i| i.id != id);
+            if self.showing_queue() {
+                self.items.retain(|i| i.id != id);
+                self.item_row = self.item_row.min(self.items.len().saturating_sub(1));
+            }
+        }
         if let Some(p) = self.playing.as_mut().filter(|p| p.item.id == id) {
             p.item.read = read;
         }
@@ -771,15 +837,88 @@ impl App {
 
     fn update_item(&mut self, id: i64, f: impl Fn(&mut Item)) {
         self.items.iter_mut().filter(|i| i.id == id).for_each(&f);
+        self.queue.iter_mut().filter(|i| i.id == id).for_each(&f);
         if let Some(r) = self.reader.as_mut().filter(|r| r.item.id == id) {
             f(&mut r.item);
         }
     }
 
+    /// Replaces Up Next on the server with `ids`, and shows what it kept.
+    fn set_queue(&mut self, backend: &impl Backend, ids: &[i64]) -> Result<()> {
+        self.queue = backend.set_queue(ids)?;
+        if self.showing_queue() {
+            self.items = self.queue.clone();
+            self.item_row = self.item_row.min(self.items.len().saturating_sub(1));
+        }
+        Ok(())
+    }
+
+    /// The current item, if it is an episode Up Next can hold.
+    fn current_episode(&self) -> Option<Item> {
+        self.current_item().filter(|i| i.media.is_some()).cloned()
+    }
+
+    /// `a`: adds the current episode to the end of Up Next, or takes it out.
+    fn toggle_queued(&mut self, backend: &impl Backend) -> Result<()> {
+        let Some(item) = self.current_episode() else {
+            self.status = "only episodes go in Up Next".into();
+            return Ok(());
+        };
+        let mut ids: Vec<i64> = self.queue.iter().map(|i| i.id).collect();
+        let queued = self.is_queued(item.id);
+        if queued {
+            ids.retain(|&id| id != item.id);
+        } else {
+            ids.push(item.id);
+        }
+        self.set_queue(backend, &ids)?;
+        self.status = if queued {
+            format!("took {} out of Up Next", item.title)
+        } else {
+            format!("added {} to Up Next ({})", item.title, self.queue.len())
+        };
+        Ok(())
+    }
+
+    /// `n`: puts the current episode first in Up Next.
+    fn play_next(&mut self, backend: &impl Backend) -> Result<()> {
+        let Some(item) = self.current_episode() else {
+            self.status = "only episodes go in Up Next".into();
+            return Ok(());
+        };
+        let mut ids = vec![item.id];
+        ids.extend(self.queue.iter().map(|i| i.id).filter(|&id| id != item.id));
+        self.set_queue(backend, &ids)?;
+        if self.showing_queue() {
+            self.item_row = 0;
+        }
+        self.status = format!("{} plays next", item.title);
+        Ok(())
+    }
+
+    /// `J`/`K` in Up Next: moves the selected episode down or up.
+    fn move_queued(&mut self, backend: &impl Backend, by: isize) -> Result<()> {
+        if !self.showing_queue() || self.focus != Pane::Items {
+            return Ok(());
+        }
+        let from = self.item_row;
+        let Some(to) = from
+            .checked_add_signed(by)
+            .filter(|&to| to < self.queue.len())
+        else {
+            return Ok(());
+        };
+        let mut ids: Vec<i64> = self.queue.iter().map(|i| i.id).collect();
+        ids.swap(from, to);
+        self.set_queue(backend, &ids)?;
+        self.item_row = to;
+        Ok(())
+    }
+
     /// Marks the selected item and every item below it in the list read,
     /// including pages not loaded yet, in one request.
     fn mark_below_read(&mut self, backend: &impl Backend) -> Result<()> {
-        if self.focus == Pane::Feeds {
+        if self.focus == Pane::Feeds || self.showing_queue() {
             return Ok(());
         }
         let Some(from) = self.items.get(self.item_row).map(|i| i.id) else {
@@ -843,6 +982,8 @@ mod tests {
         paging: std::cell::Cell<Option<(usize, bool)>>,
         /// Item lists fail while set.
         offline: std::cell::Cell<bool>,
+        /// Up Next, by id.
+        queue: RefCell<Vec<i64>>,
     }
 
     fn item(id: i64, feed: &str) -> Item {
@@ -869,6 +1010,7 @@ mod tests {
                 calls: RefCell::default(),
                 paging: std::cell::Cell::new(None),
                 offline: std::cell::Cell::new(false),
+                queue: RefCell::default(),
             }
         }
     }
@@ -950,7 +1092,34 @@ mod tests {
             it.content = Some("<p>body</p>".into());
             Ok(it)
         }
+        fn queue(&self) -> Result<Vec<Item>> {
+            let items = self.items.borrow();
+            Ok(self
+                .queue
+                .borrow()
+                .iter()
+                .filter_map(|id| items.iter().find(|i| i.id == *id).cloned())
+                .collect())
+        }
+        fn set_queue(&self, ids: &[i64]) -> Result<Vec<Item>> {
+            self.calls.borrow_mut().push(format!("queue {ids:?}"));
+            let episodes: Vec<i64> = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    self.items
+                        .borrow()
+                        .iter()
+                        .any(|i| i.id == *id && i.media.is_some())
+                })
+                .collect();
+            *self.queue.borrow_mut() = episodes;
+            self.queue()
+        }
         fn set_read(&self, id: i64, value: bool) -> Result<()> {
+            if value {
+                self.queue.borrow_mut().retain(|q| *q != id);
+            }
             self.calls.borrow_mut().push(format!("read {id} {value}"));
             self.items
                 .borrow_mut()
@@ -1253,6 +1422,73 @@ mod tests {
     }
 
     #[test]
+    fn up_next_queues_reorders_and_plays_on() {
+        let (fake, mut app, player) = podcast();
+        let queue = |app: &App| app.queue.iter().map(|i| i.id).collect::<Vec<_>>();
+        keys(&mut app, &fake, "ja");
+        assert_eq!(app.status, "only episodes go in Up Next");
+        keys(&mut app, &fake, "n");
+        assert_eq!(app.status, "only episodes go in Up Next");
+        keys(&mut app, &fake, "J");
+        assert!(app.queue.is_empty(), "J and K only work in Up Next");
+        keys(&mut app, &fake, "jja");
+        assert_eq!(app.status, "added item 4 to Up Next (1)");
+        keys(&mut app, &fake, "kkkn");
+        assert_eq!(app.status, "item 1 plays next");
+        assert_eq!(queue(&app), [1, 4]);
+
+        // The Up Next row lists it in order; J and K reorder.
+        keys(&mut app, &fake, "hjjl");
+        assert!(app.showing_queue());
+        assert_eq!(app.items.iter().map(|i| i.id).collect::<Vec<_>>(), [1, 4]);
+        keys(&mut app, &fake, "J");
+        assert_eq!((queue(&app), app.item_row), (vec![4, 1], 1));
+        keys(&mut app, &fake, "K");
+        assert_eq!((queue(&app), app.item_row), (vec![1, 4], 0));
+        keys(&mut app, &fake, "K");
+        assert_eq!(queue(&app), [1, 4], "already first");
+        keys(&mut app, &fake, "jn");
+        assert_eq!((queue(&app), app.item_row), (vec![4, 1], 0));
+        keys(&mut app, &fake, "jn");
+        assert_eq!(queue(&app), [1, 4]);
+        keys(&mut app, &fake, "M");
+        assert!(!app.items[0].read, "M does nothing in Up Next");
+
+        // Played to the end, an episode leaves Up Next and the next starts.
+        keys(&mut app, &fake, "p");
+        player.at(1000.0, true, true);
+        app.tick(&fake);
+        assert_eq!(app.status, "playing item 4");
+        assert!(
+            player
+                .calls()
+                .last()
+                .unwrap()
+                .starts_with("load https://x/4.mp3")
+        );
+        assert_eq!(queue(&app), [4]);
+        assert_eq!(app.items.iter().map(|i| i.id).collect::<Vec<_>>(), [4]);
+
+        // Stopping (not ending) doesn't go on; `a` takes it out.
+        keys(&mut app, &fake, "x");
+        assert!(app.playing.is_none());
+        keys(&mut app, &fake, "a");
+        assert_eq!(app.status, "took item 4 out of Up Next");
+        assert!(app.queue.is_empty() && app.items.is_empty());
+
+        // Finished again when already read, it is taken out by hand.
+        keys(&mut app, &fake, "hkklu");
+        keys(&mut app, &fake, "a");
+        assert_eq!(queue(&app), [1]);
+        assert!(app.items[0].read);
+        keys(&mut app, &fake, "p");
+        player.at(1000.0, true, true);
+        app.tick(&fake);
+        assert!(app.queue.is_empty() && app.playing.is_none());
+        assert_eq!(fake.calls.borrow().last().unwrap(), "queue []");
+    }
+
+    #[test]
     fn seeking_chapters_speed_and_video() {
         let (fake, mut app, player) = podcast();
         for key in ",.[]+-".chars() {
@@ -1430,13 +1666,13 @@ mod tests {
         let fake = Fake::new();
         let mut app = App::new();
         app.reload(&fake);
-        keys(&mut app, &fake, "jjj");
+        keys(&mut app, &fake, "jjjj");
         assert_eq!(app.feed_row, FIXED_ROWS + 1);
         assert!(app.items.iter().all(|i| i.feed_id == "b"));
 
         fake.set_starred(1, true).unwrap();
         fake.set_read(1, true).unwrap();
-        keys(&mut app, &fake, "kk");
+        keys(&mut app, &fake, "kkk");
         assert_eq!(app.feed_row, STARRED_ROW);
         assert_eq!(app.items.len(), 1, "read but starred item still shows");
 
@@ -1451,7 +1687,7 @@ mod tests {
         let fake = Fake::new();
         let mut app = App::new();
         app.reload(&fake);
-        keys(&mut app, &fake, "jj");
+        keys(&mut app, &fake, "jjj");
         keys(&mut app, &fake, "A");
         assert_eq!(app.status, "marked 2 items read");
         assert_eq!(app.total_unread(), 1);
@@ -1513,6 +1749,8 @@ mod tests {
             "summary":null,"content":"<p>x</p>","published":0,"read":false,"starred":false}"#;
         let (base, requests) = crate::test_server::server(vec![
             (200, feeds),
+            // No queue: an older server.
+            (404, "{}"),
             (200, page),
             (202, ""),
             (200, item),
@@ -1523,6 +1761,7 @@ mod tests {
             (204, ""),
             (404, "{}"),
             (404, "{}"),
+            (200, r#"{"items":[]}"#),
             (401, "{}"),
         ]);
         let client = Client::new(&base, Some("t".into())).unwrap();
@@ -1549,17 +1788,19 @@ mod tests {
         Backend::set_position(&client, 7, 5).unwrap();
         assert!(Backend::chapters(&client, 7).unwrap().chapters.is_empty());
         assert_eq!(Backend::transcript(&client, 7).unwrap(), None);
+        assert!(Backend::set_queue(&client, &[7]).unwrap().is_empty());
         app.reload(&client);
         assert_eq!(app.status, "error: the server rejected the token (401)");
         let paths: Vec<String> = requests
             .iter()
-            .take(12)
+            .take(14)
             .map(|h| h.split(' ').nth(1).unwrap().to_owned())
             .collect();
         assert_eq!(
             paths,
             [
                 "/api/v1/feeds",
+                "/api/v1/queue",
                 "/api/v1/items?unread=true&limit=100",
                 "/api/v1/refresh",
                 "/api/v1/items/7",
@@ -1570,6 +1811,7 @@ mod tests {
                 "/api/v1/items/7/position",
                 "/api/v1/items/7/chapters",
                 "/api/v1/items/7/transcript",
+                "/api/v1/queue",
                 "/api/v1/feeds"
             ]
         );
