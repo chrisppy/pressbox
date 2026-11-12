@@ -77,7 +77,8 @@ it with `ids` in the order given, so clients add, remove and reorder by sending
 the list they want, and answers with the new queue. Items the user can't see,
 items without media and repeats are left out, and it holds at most 500. Marking
 an item read takes it out, so finishing an episode on any client leaves Up Next
-everywhere. When an episode ends, clients start the first episode in the queue. Queued episodes are kept when a feed's old items are pruned.
+everywhere. When an episode ends, clients start the first episode in the queue.
+Queued episodes are kept when a feed's old items are pruned.
 
 `chapters` and `transcript` read the episode's chapters file and its best
 transcript (JSON, then WebVTT, SRT, HTML and plain text) so clients don't have

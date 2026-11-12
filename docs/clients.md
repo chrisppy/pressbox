@@ -77,8 +77,8 @@ pressboxd with a queue; with an older one it stays empty.
 
 A window with three panes: sources (Unread, All items, Starred, Up Next, tags
 and feeds, with unread counts), the item list with search, and the article.
-Opening an item marks it read. Its desktop entry is named "pressbox", and its Wayland app ID is
-`pressbox-iced`, for window rules.
+Opening an item marks it read. Its desktop entry is named "pressbox", and its
+Wayland app ID is `pressbox-iced`, for window rules.
 
 On a machine that isn't paired yet it asks for the server and a device name and
 shows a code to approve, as `pressbox pair` does; it then saves the token where
@@ -88,7 +88,7 @@ code, ask the server to refetch every feed, and sign out, which deletes the
 token.
 
 | Key | Action |
-| ------------- | --------------------------------------- |
+| ------------- | ------------------------------------------- |
 | `j` / `↓` | Next item |
 | `k` / `↑` | Previous item |
 | `s` | Toggle star |
@@ -120,10 +120,10 @@ end (or stopped in its last 30 seconds) is marked read. Opening an episode
 doesn't mark it read.
 
 Up Next, in the sidebar when the server has a queue, lists the episodes to play
-next; an episode's article has Add to Up Next (or Remove) and Play next
-buttons, and, in Up Next, ↑ and ↓ to reorder. When an episode plays to the end,
-the first one in Up Next starts. The queue is kept on the server, so it is the
-same in every client.
+next; an episode's article has Add to Up Next (or Remove) and Play next buttons,
+and, in Up Next, ↑ and ↓ to reorder. When an episode plays to the end, the first
+one in Up Next starts. The queue is kept on the server, so it is the same in
+every client.
 
 The player shows up in the system's media controls (MPRIS on Linux, Now Playing
 on macOS), so media keys, headphone buttons and Birdland's bar can play, pause

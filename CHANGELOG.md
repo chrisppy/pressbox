@@ -93,9 +93,9 @@ own releases.
 
 ### Terminal client
 
-- Up Next, a row under Starred that lists the server's queue: `a` adds an episode
-  or takes it out, `n` plays it next, `J`/`K` reorder, and the next episode
-  starts when one ends.
+- Up Next, a row under Starred that lists the server's queue: `a` adds an
+  episode or takes it out, `n` plays it next, `J`/`K` reorder, and the next
+  episode starts when one ends.
 - Plays podcasts in mpv: `p` plays or pauses, `V` plays the video, `x` stops,
   `,`/`.` seek, `[`/`]` move between chapters and `-`/`+` change the speed. The
   position syncs with the server, so playback resumes on any client, and an
