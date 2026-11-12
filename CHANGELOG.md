@@ -14,8 +14,8 @@ server, `pressboxctl` and the clients in this repository share one version; the
 HTTP API has its own (the `v1` in `/api/v1`), which only changes on an
 incompatible change. The Apple and Android apps,
 [pressbox-darwin](https://github.com/red-oxide/pressbox-darwin) and
-[pressbox-android](https://github.com/red-oxide/pressbox-android), have their own
-releases.
+[pressbox-android](https://github.com/red-oxide/pressbox-android), have their
+own releases.
 
 ## [2026.11.0] - Unreleased
 

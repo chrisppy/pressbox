@@ -27,11 +27,11 @@
         "treefmt-nix": "treefmt-nix"
       },
       "locked": {
-        "lastModified": 1794490258,
-        "narHash": "sha256-fpwUGcO3/FkfDGvqqiL5ee9OlaQYqldy+ln/Rgq++cA=",
+        "lastModified": 1794495672,
+        "narHash": "sha256-kRl5FQD7ykCP24Tzkqdm4jyaW0bwfQYcYEAFnv/Nm1U=",
         "owner": "red-oxide",
         "repo": "devfmt",
-        "rev": "8221b4f723b101e0058352e719f0f151643ba117",
+        "rev": "ef2d3d07495f470e58aff7c41e108ee4fe1a4a6d",
         "type": "github"
       },
       "original": {

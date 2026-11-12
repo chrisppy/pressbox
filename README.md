@@ -30,7 +30,7 @@ NixOS config ──▶ pressbox.toml ──▶ pressboxd ──▶ SQLite (items
 ```
 
 | Part | Path | What it is |
-| ------------------- | ---------------------------------------------------------------- | --------------------------------------------------- |
+| ------------------- | ----------------------------------------------------------------- | --------------------------------------------------- |
 | `pressboxd` | `crates/pressboxd` | Server: polling, storage, search, API |
 | `pressboxctl` | `crates/pressboxd/src/bin` | Pairing, devices, backups, OPML |
 | `pressbox-api` | `crates/pressbox-api` | JSON types shared by the Rust crates |
@@ -171,8 +171,8 @@ license in an SPDX header (`reuse lint` checks this, also in `nix flake check`).
   [Creative Commons Attribution-ShareAlike 4.0](LICENSES/CC-BY-SA-4.0.txt).
 
 The apps are licensed separately:
-[pressbox-darwin](https://github.com/red-oxide/pressbox-darwin) under the Mozilla
-Public License 2.0, and
+[pressbox-darwin](https://github.com/red-oxide/pressbox-darwin) under the
+Mozilla Public License 2.0, and
 [pressbox-android](https://github.com/red-oxide/pressbox-android) under the GPL
 v3.0 only, like pressbox.
 
