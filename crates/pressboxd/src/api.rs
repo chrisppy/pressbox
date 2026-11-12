@@ -16,6 +16,8 @@
 //! | PUT    | /api/v1/items/{id}/position      | `Position`       | 204                |
 //! | GET    | /api/v1/items/{id}/chapters      |                  | `Chapters`         |
 //! | GET    | /api/v1/items/{id}/transcript    |                  | `Transcript`       |
+//! | GET    | /api/v1/queue                    |                  | `Queue`            |
+//! | PUT    | /api/v1/queue                    | `QueueOrder`     | `Queue`            |
 //! | POST   | /api/v1/feeds/{id}/read-all      |                  | `Updated`          |
 //! | POST   | /api/v1/items/read-all           | `MarkRead`       | `Updated`          |
 //! | POST   | /api/v1/refresh                  |                  | 202                |
@@ -42,14 +44,14 @@ use axum::{
 };
 use pressbox_api::{
     ApproveRequest, Approved, Feed, Flag, Item, ItemPage, ItemQuery, MarkRead, Me, PairRequest,
-    PairStart, PendingPairing, Position, Updated, Version,
+    PairStart, PendingPairing, Position, Queue, QueueOrder, Updated, Version,
 };
 use serde_json::json;
 use tower_http::compression::CompressionLayer;
 
 use crate::{
     AppState,
-    db::{AuthUser, BadCursor},
+    db::{AuthUser, BadCursor, MAX_QUEUE},
     fetch::{self, now},
     media,
     pairing::{PollState, StartError, hash_token},
@@ -67,6 +69,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/items/{id}/position", put(set_position))
         .route("/items/{id}/chapters", get(chapters))
         .route("/items/{id}/transcript", get(transcript))
+        .route("/queue", get(queue).put(set_queue))
         .route("/refresh", post(refresh))
         .route("/me", get(me))
         .route("/pairings", get(pairings))
@@ -260,6 +263,28 @@ async fn set_position(
             .write(move |db| db.set_position(user.id, id, body.position))
             .await?,
     )
+}
+
+async fn queue(
+    State(state): State<Arc<AppState>>,
+    Extension(user): User,
+) -> ApiResult<Json<Queue>> {
+    let items = state.read(move |db| db.queue(user.id)).await?;
+    Ok(Json(Queue { items }))
+}
+
+async fn set_queue(
+    State(state): State<Arc<AppState>>,
+    Extension(user): User,
+    Json(order): Json<QueueOrder>,
+) -> ApiResult<Json<Queue>> {
+    if order.ids.len() > MAX_QUEUE {
+        return Err(ApiError::BadRequest("the queue holds at most 500 episodes"));
+    }
+    let items = state
+        .write(move |db| db.set_queue(user.id, &order.ids))
+        .await?;
+    Ok(Json(Queue { items }))
 }
 
 /// How long a chapters or transcript file is used before it is fetched
@@ -1168,6 +1193,53 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_queue_keeps_episodes_in_order() {
+        use pressbox_api::Queue;
+        let (addr, _) = file_server().await;
+        let s = podcast_state(addr);
+        let queue = |method: &'static str, body: Option<&'static str>| {
+            let s = s.clone();
+            async move {
+                let (status, body) = call(&s, method, "/api/v1/queue", body, T).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                serde_json::from_str::<Queue>(&body)
+                    .unwrap()
+                    .items
+                    .iter()
+                    .map(|i| i.title.clone())
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert!(queue("GET", None).await.is_empty());
+
+        // In the order sent; 2 has no media, 99 doesn't exist, and the
+        // second 4 is a repeat: all left out.
+        assert_eq!(
+            queue("PUT", Some(r#"{"ids":[4,2,1,99,4,3]}"#)).await,
+            ["4", "1", "3"]
+        );
+        assert_eq!(queue("GET", None).await, ["4", "1", "3"]);
+        // Reordering and removing are sending the list wanted.
+        assert_eq!(queue("PUT", Some(r#"{"ids":[3,4]}"#)).await, ["3", "4"]);
+
+        // Finishing an episode (marking it read) takes it out.
+        call(
+            &s,
+            "PUT",
+            "/api/v1/items/3/read",
+            Some(r#"{"value":true}"#),
+            T,
+        )
+        .await;
+        assert_eq!(queue("GET", None).await, ["4"]);
+
+        let too_many = format!(r#"{{"ids":[{}]}}"#, vec!["1"; MAX_QUEUE + 1].join(","));
+        let (status, _) = call(&s, "PUT", "/api/v1/queue", Some(&too_many), T).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(queue("GET", None).await, ["4"], "unchanged");
     }
 
     #[tokio::test(flavor = "multi_thread")]

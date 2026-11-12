@@ -207,7 +207,21 @@ const MIGRATIONS: &[&str] = &[
     r"
     UPDATE sources SET etag = NULL, last_modified = NULL, next_fetch = 0;
     ",
+    // 9: each user's Up Next queue of episodes, in `rank` order. Entries go
+    // with their item or user.
+    r"
+    CREATE TABLE queue (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+        rank    INTEGER NOT NULL,
+        PRIMARY KEY (user_id, item_id)
+    ) WITHOUT ROWID;
+    CREATE INDEX queue_by_item ON queue (item_id);
+    ",
 ];
+
+/// The most episodes a user's queue holds.
+pub const MAX_QUEUE: usize = 500;
 
 /// An entry parsed (and sanitized) from a feed, ready to store.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -764,11 +778,12 @@ impl Db {
     }
 
     /// Deletes the oldest items beyond `max` for a feed URL, and any
-    /// published before `older_than`, except ones anybody starred.
+    /// published before `older_than`, except ones anybody starred or queued.
     pub fn prune(&self, source: &str, max: u32, older_than: Option<i64>) -> Result<usize> {
         Ok(self.conn.execute(
             "DELETE FROM items WHERE source = ?1
                AND id NOT IN (SELECT item_id FROM item_state WHERE starred = 1)
+               AND id NOT IN (SELECT item_id FROM queue)
                AND (published < ?3
                     OR id NOT IN (SELECT id FROM items WHERE source = ?1
                                   ORDER BY published DESC, id DESC LIMIT ?2))",
@@ -954,9 +969,16 @@ impl Db {
         Ok(changed > 0)
     }
 
-    /// Returns false if the user cannot see that item.
+    /// Returns false if the user cannot see that item. Marking an item read
+    /// (finishing an episode, say) takes it out of the user's queue.
     pub fn set_read(&self, user: i64, id: i64, read: bool) -> Result<bool> {
-        self.set_flag(user, id, Flag::Read, read)
+        let changed = self.set_flag(user, id, Flag::Read, read)?;
+        if changed && read {
+            self.conn
+                .prepare_cached("DELETE FROM queue WHERE user_id = ?1 AND item_id = ?2")?
+                .execute(params![user, id])?;
+        }
+        Ok(changed)
     }
 
     /// Returns false if the user cannot see that item. Unstarring the last
@@ -982,6 +1004,42 @@ impl Db {
             ))?
             .execute(params![user, id, position])?;
         Ok(changed > 0)
+    }
+
+    /// The user's Up Next queue, in order: the queued items they can still
+    /// see, without content.
+    pub fn queue(&self, user: i64) -> Result<Vec<Item>> {
+        let mut stmt = self.conn.prepare_cached(&format!(
+            "SELECT {ITEM_COLUMNS}, NULL FROM queue q JOIN items i ON i.id = q.item_id
+             {USER_JOINS}
+             WHERE q.user_id = ?1 AND {VISIBLE}
+             ORDER BY q.rank"
+        ))?;
+        let items = stmt
+            .query_map(params![user], item_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(items)
+    }
+
+    /// Replaces the user's queue with `ids`, in that order, leaving out items
+    /// they can't see, items without media and repeats. Returns the new queue.
+    pub fn set_queue(&mut self, user: i64, ids: &[i64]) -> Result<Vec<Item>> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM queue WHERE user_id = ?1", params![user])?;
+        {
+            // `OR IGNORE` drops repeats: the first place an item is listed
+            // wins.
+            let mut insert = tx.prepare_cached(&format!(
+                "INSERT OR IGNORE INTO queue (user_id, item_id, rank)
+                 SELECT ?1, i.id, ?3 FROM items i {USER_JOINS}
+                 WHERE i.id = ?2 AND i.media IS NOT NULL AND {VISIBLE}"
+            ))?;
+            for (rank, id) in ids.iter().enumerate() {
+                insert.execute(params![user, id, i64::try_from(rank)?])?;
+            }
+        }
+        tx.commit()?;
+        self.queue(user)
     }
 
     /// An item's media, if the user can see the item. `Some(None)`: they
@@ -2141,6 +2199,47 @@ mod tests {
         assert_eq!(left, [500, 400, 300, 0]);
         assert_eq!(db.prune(A, 2, Some(300)).unwrap(), 1);
         assert_eq!(db.items(chris, &q()).unwrap().items.len(), 3);
+    }
+
+    #[test]
+    fn queues_are_per_user_and_kept_from_pruning() {
+        let (mut db, chris, anna) = two_users();
+        let episodes: Vec<_> = (0..4)
+            .map(|n| NewItem {
+                media: Some(Media::default()),
+                ..item(&format!("e{n}"), Some(n * 100))
+            })
+            .collect();
+        db.upsert_items(A, 0, &episodes).unwrap();
+        let ids: Vec<_> = db
+            .items(chris, &q())
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| i.id)
+            .collect();
+        let (newest, oldest) = (ids[0], ids[3]);
+
+        let queued = db.set_queue(chris, &[oldest, newest]).unwrap();
+        assert_eq!(
+            queued.iter().map(|i| i.id).collect::<Vec<_>>(),
+            [oldest, newest]
+        );
+        assert_eq!(queued[0].content, None, "like lists, without content");
+        assert!(
+            db.queue(anna).unwrap().is_empty(),
+            "each user has their own"
+        );
+
+        // The oldest would go, but it is queued.
+        assert_eq!(db.prune(A, 2, None).unwrap(), 1);
+        assert_eq!(db.queue(chris).unwrap().len(), 2);
+        assert!(db.item(chris, oldest).unwrap().is_some());
+
+        // Emptied, it can be pruned.
+        db.set_queue(chris, &[]).unwrap();
+        assert_eq!(db.prune(A, 2, None).unwrap(), 1);
+        assert!(db.item(chris, oldest).unwrap().is_none());
     }
 
     #[test]

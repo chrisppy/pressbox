@@ -35,6 +35,11 @@ own releases.
   file and best transcript (JSON, WebVTT, SRT, HTML or text) into one JSON shape
   each, so clients don't parse them; files are kept for a week.
 
+- An Up Next queue per user: `GET /api/v1/queue` lists the episodes to play
+  next, and `PUT /api/v1/queue` replaces it with a list of ids, which is how
+  clients add, remove and reorder. Marking an item read takes it out, and queued
+  episodes are kept from pruning. Database migration 9 adds the table.
+
 - Database migration 7 adds the columns and a table for those files, and 8
   fetches every feed in full once, so episodes stored before the upgrade get
   their media.

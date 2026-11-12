@@ -26,6 +26,8 @@ is about that user's feeds and state. Timestamps are Unix seconds.
 | PUT | `/api/v1/items/{id}/position` | `{"position": seconds}` | 204 |
 | GET | `/api/v1/items/{id}/chapters` | | `{chapters: [Chapter]}`; 404 if none; 502 if unreadable |
 | GET | `/api/v1/items/{id}/transcript` | | `{segments: [Segment]}`; 404 if none; 502 if unreadable |
+| GET | `/api/v1/queue` | | `{items}` |
+| PUT | `/api/v1/queue` | `{"ids": [id]}` | `{items}`; 400 over 500 |
 | POST | `/api/v1/feeds/{id}/read-all` | | `{"updated": n}` |
 | POST | `/api/v1/items/read-all` | the list's filters, optional `from` item id | `{"updated": n}` |
 | POST | `/api/v1/refresh` | | 202 |
@@ -68,6 +70,14 @@ while playing and when pausing or stopping, and the last write wins. When an
 episode is finished, clients mark it read and set its position to 0.
 `in_progress=true` lists unread items with a saved position (started, not
 finished); `media=true` lists only items with media.
+
+Each user has an Up Next queue: `GET /api/v1/queue` lists the episodes to play
+next, in order, as list items (without `content`). `PUT /api/v1/queue` replaces
+it with `ids` in the order given, so clients add, remove and reorder by sending
+the list they want, and answers with the new queue. Items the user can't see,
+items without media and repeats are left out, and it holds at most 500. Marking
+an item read takes it out, so finishing an episode on any client leaves Up Next
+everywhere. Queued episodes are kept when a feed's old items are pruned.
 
 `chapters` and `transcript` read the episode's chapters file and its best
 transcript (JSON, then WebVTT, SRT, HTML and plain text) so clients don't have

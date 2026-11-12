@@ -167,6 +167,21 @@ pub struct Position {
     pub position: u32,
 }
 
+/// Response to `GET` and `PUT /api/v1/queue`: the user's Up Next list, the
+/// episodes to play next in order. Items come as in lists, without `content`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Queue {
+    pub items: Vec<Item>,
+}
+
+/// Body for `PUT /api/v1/queue`: the whole list in order, replacing the one
+/// before. Clients add, remove and reorder by sending the list they want.
+/// Items the user can't see, items without media, and repeats are left out.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueOrder {
+    pub ids: Vec<i64>,
+}
+
 /// Response to `GET /api/v1/items/{id}/chapters`, from the episode's
 /// Podcasting 2.0 chapters file.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
