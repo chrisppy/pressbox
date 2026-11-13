@@ -14,7 +14,7 @@ is about that user's feeds and state. Timestamps are Unix seconds.
 | Method | Path | Body / query | Response |
 | ------ | --------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- |
 | GET | `/health` | | `ok` |
-| GET | `/api/v1/version` | | `{version, api}`, e.g. `{"version": "2026.11.0", "api": 1}` |
+| GET | `/api/v1/version` | | `{version, api}`, e.g. `{"version": "26.0.0", "api": 1}` |
 | POST | `/api/v1/pair` | `{"name": str}` | `{code, poll_id, expires_in}`; 429 when too many wait |
 | GET | `/api/v1/pair/{poll_id}` | | 202 pending; `{token, name}` once; 404 |
 | GET | `/api/v1/me` | | `{user, admin, device}` |

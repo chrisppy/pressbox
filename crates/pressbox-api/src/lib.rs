@@ -25,7 +25,7 @@ pub struct Feed {
     pub total: u32,
     /// How many of `total` are podcast episodes (items with media), so
     /// clients can tell podcasts from news. Absent from servers before
-    /// 2026.11.
+    /// 26.0.
     #[serde(default)]
     pub episodes: u32,
     /// How many of `unread` are episodes.
@@ -386,7 +386,7 @@ pub const API_VERSION: u32 = 1;
 /// `GET /api/v1/version`, which needs no token.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Version {
-    /// pressboxd's version, e.g. `2026.11.0`.
+    /// pressboxd's version, e.g. `26.0.0`.
     pub version: String,
     /// The API version, as in `/api/v1`.
     pub api: u32,

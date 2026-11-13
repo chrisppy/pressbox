@@ -4695,7 +4695,7 @@ checksum = "925383efa346730478fb4838dbe9137d2a47675ad789c546d150a6e1dd4ab31c"
 
 [[package]]
 name = "pressbox"
-version = "2026.11.0"
+version = "26.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4711,14 +4711,14 @@ dependencies = [
 
 [[package]]
 name = "pressbox-api"
-version = "2026.11.0"
+version = "26.0.0"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "pressbox-iced"
-version = "2026.11.0"
+version = "26.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4741,7 +4741,7 @@ dependencies = [
 
 [[package]]
 name = "pressboxd"
-version = "2026.11.0"
+version = "26.0.0"
 dependencies = [
  "ammonia",
  "anyhow",

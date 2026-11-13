@@ -1,15 +1,14 @@
 <!--
-SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org>
-SPDX-License-Identifier: GPL-3.0-only
--->
+SPDX-FileCopyrightText: 2026 Chris Palmer <chris@red-oxide.org> SPDX-License-Identifier:
+GPL-3.0-only -->
 
 # Changelog
 
 All notable changes to pressbox. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions are
-[calendar versions](https://calver.org/), `YYYY.M.PATCH`: the year and month of
-the release, then a count that starts at 0 each month (2026.11.0, 2026.11.1,
-2026.12.0). They say when, not how much changed; read the entries for that. The
+[calendar versions](https://calver.org/), `YY.MINOR.PATCH`: the year of the
+release, then a count of that year's releases and a count of fixes to each, both
+starting at 0 (26.0.0, then 26.0.1 for a fix, 26.1.0, and 27.0.0 in January). They say when, not how much changed; read the entries for that. The
 server, `pressboxctl` and the clients in this repository share one version; the
 HTTP API has its own (the `v1` in `/api/v1`), which only changes on an
 incompatible change. The Apple and Android apps,
@@ -17,7 +16,7 @@ incompatible change. The Apple and Android apps,
 [pressbox-android](https://github.com/red-oxide/pressbox-android), have their
 own releases.
 
-## [2026.11.0] - Unreleased
+## [26.0.0] - Unreleased
 
 - The logo's home plate is filled rather than outlined, matching the
   pressbox-darwin and pressbox-android app icons. It is also pressbox-iced's
@@ -152,4 +151,4 @@ The first release.
   reuse lint; `cargo deny` in CI.
 
 [0.1.0]: https://github.com/red-oxide/pressbox/releases/tag/v0.1.0
-[2026.11.0]: https://github.com/red-oxide/pressbox/compare/v0.1.0...v2026.11.0
+[26.0.0]: https://github.com/red-oxide/pressbox/compare/v0.1.0...v26.0.0
