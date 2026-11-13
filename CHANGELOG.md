@@ -70,6 +70,10 @@ own releases.
   refused at startup with a clear message, instead of failing on the first
   connection.
 
+- Feeds report `episodes` and `unread_episodes`: how many of their items, in all
+  and unread, are podcast episodes (have media). Clients use them to show
+  podcasts, news or both.
+
 ### Desktop client
 
 - Up Next: the server's queue in the sidebar, Add to Up Next and Play next on

@@ -831,7 +831,8 @@ impl Db {
             "SELECT s.feed_id, COALESCE(s.title, src.title, s.feed_id), src.url, src.site_url,
                     s.tags, COUNT(i.id) - COALESCE(SUM(st.read), 0), COUNT(i.id),
                     src.last_fetched, CASE WHEN s.archived = 0 THEN src.last_error END,
-                    s.archived, src.image, src.medium
+                    s.archived, src.image, src.medium, COUNT(i.media),
+                    COUNT(i.media) - COALESCE(SUM(CASE WHEN i.media IS NOT NULL THEN st.read END), 0)
              FROM subscriptions s
              JOIN sources src ON src.url = s.source
              LEFT JOIN items i ON i.source = s.source
@@ -855,6 +856,8 @@ impl Db {
                 archived: r.get(9)?,
                 image: r.get(10)?,
                 medium: r.get(11)?,
+                episodes: r.get(12)?,
+                unread_episodes: r.get(13)?,
             })
         })?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -2199,6 +2202,39 @@ mod tests {
         assert_eq!(left, [500, 400, 300, 0]);
         assert_eq!(db.prune(A, 2, Some(300)).unwrap(), 1);
         assert_eq!(db.items(chris, &q()).unwrap().items.len(), 3);
+    }
+
+    #[test]
+    fn feeds_count_episodes_apart() {
+        let (mut db, chris, anna) = two_users();
+        let mut items: Vec<_> = (0..3)
+            .map(|n| NewItem {
+                media: Some(Media::default()),
+                ..item(&format!("e{n}"), Some(n * 100))
+            })
+            .collect();
+        items.push(item("news", Some(500)));
+        db.upsert_items(A, 0, &items).unwrap();
+        let newest_episode = db
+            .items(chris, &q())
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|i| i.media.is_some())
+            .unwrap()
+            .id;
+        db.set_read(chris, newest_episode, true).unwrap();
+        let counts = |user| {
+            let feed = db
+                .feeds(user)
+                .unwrap()
+                .into_iter()
+                .find(|f| f.url == A)
+                .unwrap();
+            (feed.total, feed.episodes, feed.unread, feed.unread_episodes)
+        };
+        assert_eq!(counts(chris), (4, 3, 3, 2));
+        assert_eq!(counts(anna), (4, 3, 4, 3), "read state is per user");
     }
 
     #[test]

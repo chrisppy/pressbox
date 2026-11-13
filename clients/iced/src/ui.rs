@@ -726,6 +726,8 @@ mod tests {
             archived: false,
             image: None,
             medium: None,
+            episodes: 0,
+            unread_episodes: 0,
         }
     }
 

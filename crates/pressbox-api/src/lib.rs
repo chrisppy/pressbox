@@ -23,6 +23,14 @@ pub struct Feed {
     pub tags: Vec<String>,
     pub unread: u32,
     pub total: u32,
+    /// How many of `total` are podcast episodes (items with media), so
+    /// clients can tell podcasts from news. Absent from servers before
+    /// 2026.11.
+    #[serde(default)]
+    pub episodes: u32,
+    /// How many of `unread` are episodes.
+    #[serde(default)]
+    pub unread_episodes: u32,
     /// When the feed was last fetched, successfully or not.
     pub last_fetched: Option<i64>,
     /// The error from the last fetch, if it failed.

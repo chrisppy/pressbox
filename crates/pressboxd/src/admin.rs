@@ -427,6 +427,8 @@ mod tests {
             archived,
             image: None,
             medium: None,
+            episodes: 0,
+            unread_episodes: 0,
         };
         let doc = opml_document(&[feed("kept", false), feed("old", true)]);
         assert!(doc.contains(r#"title="&quot;kept&quot;""#), "{doc}");
