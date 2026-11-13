@@ -62,9 +62,9 @@ which is where video and other bitrates come from), and, when the feed says,
 `duration` (seconds), `image`, `season`, `episode`, `chapters` and
 `transcripts`. RSS `<enclosure>`, Atom `rel="enclosure"` links and JSON Feed
 attachments all count. Every URL is absolute `http(s)`. A feed has `image` (its
-artwork) and `medium` (`podcast:medium`) when it says, and always `episodes`
-and `unread_episodes`: how many of its `total` and `unread` items have media,
-so clients can tell podcasts from news.
+artwork) and `medium` (`podcast:medium`) when it says, and always `episodes` and
+`unread_episodes`: how many of its `total` and `unread` items have media, so
+clients can tell podcasts from news.
 
 `position` is where this user stopped playing, in seconds; it is left out
 when 0. Clients save it with `PUT /api/v1/items/{id}/position` every so often
