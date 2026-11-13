@@ -22,6 +22,7 @@ own releases.
 - The logo's home plate is filled rather than outlined, matching the
   pressbox-darwin and pressbox-android app icons. It is also pressbox-iced's
   icon on Linux.
+
 ### Server
 
 - Podcasts (Podcasting 2.0). Items carry their audio and video as `media`: the
