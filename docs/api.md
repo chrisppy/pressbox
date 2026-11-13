@@ -12,7 +12,7 @@ or the static `tokenFile` token. A token belongs to one user, and every answer
 is about that user's feeds and state. Timestamps are Unix seconds.
 
 | Method | Path | Body / query | Response |
-| ------ | --------------------------------- | ---------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| ------ | --------------------------------- | ---------------------------------------------------------------------------------- | -------------------------------------------------------- |
 | GET | `/health` | | `ok` |
 | GET | `/api/v1/version` | | `{version, api}`, e.g. `{"version": "26.0.0", "api": 1}` |
 | POST | `/api/v1/pair` | `{"name": str}` | `{code, poll_id, expires_in}`; 429 when too many wait |
